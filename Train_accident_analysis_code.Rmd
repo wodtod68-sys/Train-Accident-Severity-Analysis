@@ -1,0 +1,2162 @@
+---
+title: "IMEN 415 Project 1: Train Accident Severity Analysis"
+subtitle: "Evidence-Informed Recommendations for the Federal Railroad Administration"
+author: "Group Project (최정우 2022170841, 천세환 2022170838, 곽준우 2022170807)"
+date: "`r Sys.Date()`"
+output:
+  word_document:
+    toc: true
+    toc_depth: 3
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.align = 'center', fig.width = 7, fig.height = 5)
+knitr::opts_knit$set(root.dir = "/Users/kwakjoonoo/Desktop/Multivariate_Analysis")
+```
+
+# Executive Summary
+
+This study uses evidence-informed systems engineering to investigate contributors to railroad accident severity and to provide actionable safety recommendations to the Federal Railroad Administration (FRA). We test four well-formed hypotheses across two severity metrics — Accident Damage (ACCDMG) and Casualties (TOTINJ + TOTKLD) — using FRA accident data filtered to extreme cases (ACCDMG above the upper whisker; Casualties greater than or equal to 1).
+
+**Hypotheses tested:**
+
+| # | Severity Metric | Interaction Hypothesis | Outcome |
+|---|----------------|----------------------|---------|
+| H1 | ACCDMG | Location Type x Train Speed | **Reject H0** (Rural shows steeper speed sensitivity) |
+| H2 | ACCDMG | Mega Train x Train Speed (with CARS control) | **Reject H0** (Long trains amplify high-speed damage) |
+| H3 | Casualties | Accident Type x Train Speed (Derailment vs Collision) | **Fail to Reject H0** |
+| H4 | Casualties | Track Type x Train Speed (OpenLine vs YardType) | **Fail to Reject H0** |
+
+**Methodological framework applied to all hypotheses:**
+
+1. Hypothesis formulation with theoretical justification
+2. Exploratory data analysis and feature engineering
+3. Sequential linear model construction (main effects, interaction, second-order)
+4. Model assessment (Adjusted R-squared, AIC, BIC, Partial F-test)
+5. Diagnostic verification (residuals, normality, homoscedasticity)
+6. Box-Cox transformation for variance stabilization
+7. Multicollinearity assessment via VIF and centering
+8. Bootstrap confidence intervals (R = 1,000) for distribution-free inference
+9. Cross-validation for out-of-sample predictive validation
+10. Poisson GLM as supplementary robustness check
+
+**Key findings:**
+
+- **Train speed is universally significant** across all four hypotheses, with the effect following a quadratic (kinetic-energy) relationship.
+- **Location and operational context matter for damage**: rural areas and mega-trains exhibit disproportionately steeper damage curves at high speeds.
+- **Casualties show different mechanisms**: speed and accident/track type act as additive main effects rather than interactive ones, with intercept differences (not slope differences) driving group-level disparities.
+- **Universal speed reduction policies emerge as the most robust recommendation**, complemented by targeted infrastructure investments in high-risk corridors.
+
+---
+
+# Data Loading and Preprocessing
+
+```{r data_loading}
+traindir <- '/Users/kwakjoonoo/Desktop/Multivariate_Analysis/Train Data'
+sourcedir <- '/Users/kwakjoonoo/Desktop/Multivariate_Analysis'
+setwd(sourcedir)
+source("AccidentInput.R")
+
+library(ggplot2)
+library(dplyr)
+library(car)
+library(MASS)
+library(ggfortify)
+library(boot)
+library(geosphere)
+library(maps)
+library(gridExtra)
+
+# Load and combine accident data
+acts <- file.inputl(traindir)
+totacts <- combine.data(acts)
+
+# Categorical variable setup
+totacts$TYPE <- factor(totacts$TYPE, labels = c("Derailment", "HeadOn",
+                                                "Rearend", "Side", "Raking", "BrokenTrain", "Hwy-Rail",
+                                                "GradeX", "Obstruction", "Explosive", "Fire", "Other",
+                                                "SeeNarrative"))
+
+totacts$TYPEQ <- sub("\\.0$", "", totacts$TYPEQ)
+totacts$TYPEQ[totacts$TYPEQ %in% c("O", "")] <- ""
+totacts$TYPEQ <- factor(totacts$TYPEQ, labels = c("NA", "Freight", "Passenger", "Commuter",
+                                                  "Work", "Single", "CutofCars", "Yard", "Light", "Maint",
+                                                  "MaintOfWay", "Passenger", "Commuter", "ElectricMulti", "ElectricMulti"))
+
+totacts$Cause <- rep(NA, nrow(totacts))
+totacts$Cause[which(substr(totacts$CAUSE, 1, 1) == "M")] <- "M"
+totacts$Cause[which(substr(totacts$CAUSE, 1, 1) == "T")] <- "T"
+totacts$Cause[which(substr(totacts$CAUSE, 1, 1) == "S")] <- "S"
+totacts$Cause[which(substr(totacts$CAUSE, 1, 1) == "H")] <- "H"
+totacts$Cause[which(substr(totacts$CAUSE, 1, 1) == "E")] <- "E"
+totacts$Cause <- factor(totacts$Cause)
+
+# Compute Casualties = injuries + fatalities
+totacts$Casualties <- totacts$TOTINJ + totacts$TOTKLD
+
+# Remove duplicates
+totacts_nd <- totacts[!(duplicated(totacts[, c("INCDTNO", "YEAR", "MONTH", "DAY",
+                                                "TIMEHR", "TIMEMIN")])), ]
+
+# Filter to extreme cases per project specification
+dmgbox <- ggplot(totacts_nd, aes(y = ACCDMG)) + geom_boxplot()
+upper  <- ggplot_build(dmgbox)$data[[1]]$ymax
+
+df_accdmg     <- totacts_nd %>% filter(ACCDMG > upper)            # Damage above upper whisker
+df_casualties <- totacts_nd %>% filter(Casualties >= 1)           # At least one casualty
+
+cat("Filtered samples:\n")
+cat("  ACCDMG (damage > upper whisker):", nrow(df_accdmg), "incidents\n")
+cat("  Casualties (>= 1):", nrow(df_casualties), "incidents\n")
+```
+
+---
+
+# Problem 1: Generating Hypotheses (20 points)
+
+We propose four well-formed, actionable hypotheses — two for each severity metric. Each hypothesis specifies an interaction between a qualitative variable and a quantitative variable, supported by theoretical literature, descriptive statistics, and visualizations. All hypotheses are designed so that the test outcome translates directly into an FRA policy lever.
+
+**Note on the quadratic speed term I(TRNSPD^2):** Throughout this report, several models include a squared speed term in addition to the linear speed term. The full justification for incorporating the quadratic term is presented in detail in Hypothesis 4 (Casualties Analysis, Problem 3) and rests on three converging lines of evidence: (i) the physics of kinetic energy E = (1/2)mv-squared; (ii) visual evidence from LOESS smoothing showing curvature; and (iii) residual diagnostics from the linear-only model showing a U-shaped residual pattern. To avoid repetition, this rationale is stated once in full and referenced thereafter.
+
+---
+
+## Hypothesis 1 (ACCDMG): Location Type x Train Speed
+
+### Hypothesis Statement
+
+$$H_0:\;\beta_{\text{LOCATION\_TYPE(Rural):TRNSPD}} = 0 \quad \text{(No difference in speed sensitivity by location)}$$
+
+$$H_1:\;\beta_{\text{LOCATION\_TYPE(Rural):TRNSPD}} > 0 \quad \text{(Rural areas show higher speed sensitivity than urban)}$$
+
+When a derailment occurs, the magnitude by which train speed (TRNSPD) escalates accident damage (ACCDMG) is hypothesized to differ significantly across the urban accessibility of the accident site (LOCATION_TYPE). Specifically: **the further from urban centers, the larger the damage increase per unit of speed**.
+
+### Theoretical Justification
+
+**(1) Interaction Effect of Location Type and Train Speed**
+
+In railway accidents, the spatial characteristics of the track (location/area type) and train operating speed do not act independently — when combined, they maximize the scale of accident damage. According to Hao and Daniel (2014), train speed and area type were identified as core multi-factor determinants of driver injury severity at both active and passive railroad grade crossings. In particular, in non-urban rural areas or open environments, trains are more likely to operate at higher speeds; when this high speed combines with the rural environmental context, the probability of fatal injuries and severe damage increases sharply (Khan and Khattak, 2018; Zhao et al., 2019). Furthermore, regarding track accessibility and type, Ahmed et al. (2023) empirically demonstrated that collisions on main tracks have substantially higher injury and fatality probabilities than incidents in yards, sidings, or industrial zones. This indicates that when the locational characteristic (LOCATION_TYPE) of a main line or open area where trains can sustain high speeds interacts with high train speed (TRNSPD), the system's physical impact is maximized and accident severity escalates dramatically.
+
+**Citation:** Hao, W., and Daniel, J. (2014). Motor vehicle driver injury severity study under various traffic control at highway-rail grade crossings in the United States. *Journal of Safety Research*, 51, 41-48; Khan, W. A., and Khattak, A. J. (2018). Injury severity of truck drivers in crashes at highway-rail grade crossings in the United States. *Transportation Research Record*, 2672(10), 38-47; Ahmed, S. S., Corman, F., and Anastasopoulos, P. C. (2023). Accounting for unobserved heterogeneity and spatial instability in the analysis of crash injury-severity at highway-rail grade crossings. *Analytic Methods in Accident Research*, 37, 100250.
+
+**(2) Combined Effect of Area Type/Infrastructure and Train Speed**
+
+Transportation accident severity is exponentially amplified not only by the simple physical speed of the vehicle but also through interactions with the population-density zone (urban, suburban, rural) where the accident occurred and the fixed environmental features of the track surroundings. According to U.S. accident severity category data cited in the IAEA Transport Risk Assessment Report (2003), although urban areas show higher overall accident frequencies, the damage scale remained minor. Conversely, in rural or peripheral areas where trains can sustain high speeds with fewer obstacles, the conditional probability of the highest severity category (Category 6) — accidents accompanied by severe physical impact and large fires — was approximately 54 times higher (7.0E-6) than in urban areas (1.3E-7). Furthermore, IAEA's probabilistic accident assessment methodology specifies that the damage caused by derailment or collision (ACCDMG) is connected to destructive damage when high-kinetic-energy trains interact laterally with fixed features along the route, such as bridge abutments, tunnels, and trackside structures, rather than from the train's running speed alone. This strongly supports the interaction hypothesis that when specific locational environments (LOCATION_TYPE) where trains operate at high speeds combine with train speed (TRNSPD), the system's destructive force is maximized, leading to extreme accident damage.
+
+**Citation:** International Atomic Energy Agency. (2003). *Input data for quantifying risks associated with the transport of radioactive material* (IAEA-TECDOC-1346). IAEA, Vienna.
+
+### Expectation
+
+Even under identical high-speed derailment conditions, peripheral rural areas with limited recovery equipment and slower emergency response are expected to exhibit a steeper damage escalation with increasing speed compared to urban areas with rapid response capabilities.
+
+---
+
+## Hypothesis 2 (ACCDMG): Mega Train x Train Speed (with CARS control)
+
+### Hypothesis Statement
+
+$$H_0:\;\beta_{\text{MEGA\_TRAIN:TRNSPD}} = 0 \quad \text{(No difference in speed sensitivity by train length)}$$
+
+$$H_1:\;\beta_{\text{MEGA\_TRAIN:TRNSPD}} > 0 \quad \text{(Mega-trains exhibit higher speed sensitivity than regular trains)}$$
+
+### Theoretical Justification
+
+**(1) Cascading Accordion-Style Pile-Up Due to "Residual Train Length"**
+
+The physical characteristics of mega-trains create numerous "residual cars" behind the point of derailment. When derailment occurs at the front during high-speed operation, the high-speed momentum (kinetic energy) of the enormous number of trailing cars cannot be controlled and consecutively crashes into the previously derailed cars. According to the literature, "when the derailment starting point is at the front of the train, the more residual cars trailing behind, the more cars end up derailing." This is empirically demonstrated in cases such as the East Palestine accident (149-car mega-train) and the Tamaroa accident (108-car train), where long, high-speed train derailments form an "accordion-style pile-up" — cars crumpling layer upon layer — extremely amplifying vehicle damage and accident costs.
+
+**Citation:** Liu, X., Barkan, C. P. L., and Saat, M. R. (2011). *Transportation Research Record*, 2261; FRA, *Accident Investigation Summary Report HQ-2023-1813*; NRC, *NUREG/CR-7034*.
+
+**(2) Synergy of Multi-Hazmat Damage and Uncontrollable Widespread Severe Fire**
+
+Mega-trains are often configured as "unit trains" or "key trains," transporting large quantities of hazardous materials at once. When such mega-trains experience accidents at high speeds, the enormous impact force dramatically increases the probability that multiple hazmat tank cars are simultaneously damaged. According to severity analysis reports, in the New Brighton accident (86 cars at 37 mph) and the Eunice accident (113 cars at 39 mph), large numbers of hazmat cars loaded on long trains were destroyed en masse during high-speed derailment, forming an enormous fuel source. This caused uncontrollable "widespread severe fires," dramatically increasing severity. Therefore, the combination of mega-train cargo concentration and high-speed operation creates a catastrophic synergistic effect that maximizes the fuel and ignition scale of large fires.
+
+**Citation:** NRC, NUREG/CR-7034. *Analysis of Severe Railway Accidents Involving Long Duration Fires*.
+
+### Expectation
+
+- **Beta_TRNSPD (main effect of speed): Positive (+) and significant.** Regardless of train type, faster speeds increase physical impact and thus damage.
+- **Beta_CARS (control variable effect): Positive (+) and significant.** More hazmat-loaded cars provide more fuel for fires and explosions, thereby enlarging the baseline damage independently of the interaction.
+- **Beta_MEGA_TRAIN:TRNSPD (key interaction): Positive (+) and significant.** This term must reach p < 0.05 with a positive coefficient for the central physical intuition — that high speed combined with hundreds of trailing rail cars (mega-train) amplifies destructive force exponentially — to be statistically validated.
+
+This systems-engineering proof goes beyond one-dimensional explanations such as "fast trains cause large damage" or "hazmat is dangerous." It demonstrates with data that "when physical energy combining mass and speed encounters chemical fuel (hazmat) above a critical threshold, the system reaches catastrophic failure." On this basis, FRA can be presented with evidence-informed recommendations to "introduce mandatory speed restrictions on mega-trains carrying a certain number of hazmat cars on specific track segments to prevent exponential damage escalation."
+
+---
+
+## Hypothesis 3 (Casualties): Accident Type x Train Speed (Derailment vs Collision)
+
+### Hypothesis Statement
+
+$$H_0:\;\beta_{\text{Collision:TRNSPD}} = 0 \quad \text{(No difference in speed sensitivity)}$$
+
+$$H_A:\;\beta_{\text{Collision:TRNSPD}} < 0 \quad \text{(Collision shows lower speed sensitivity than derailment)}$$
+
+Both derailments (TYPE 01) and collisions (TYPE 02-06) cause casualties, but the slope of the effect of train speed (TRNSPD) on casualty count is predicted to differ by accident type. This hypothesis posits that **derailment shows a steeper increase in casualties with increasing speed than collision does**.
+
+### Theoretical Justification
+
+**(1) Cascading Derailment Effect**
+
+When derailment occurs at high speed, the lead car's deviation cascades to trailing cars in a domino effect. According to Liu's (2016) analysis of Class I U.S. freight railroads from 2000-2014, derailment accidents involved an average of **6.7 derailed cars per incident**, while collision accidents averaged only **2.9 cars** (Table 1). As speed increases, the train's kinetic energy (KE = (1/2)mv-squared) grows, and this energy propagates the cascading deviation to more cars, exponentially expanding the casualty exposure scale. Barkan et al. (2003) empirically demonstrated that train speed is the primary determinant of damage scale in derailment accidents, and Liu et al. (2012) statistically confirmed that speed violations are a key cause of large-scale derailments.
+
+**Citation:** Liu, X. (2016). Analysis of Collision Risk for Freight Trains in the United States. *Transportation Research Record*, 2546, 121-128; Barkan, C. P. L., Dick, C. T., and Anderson, R. (2003). Railroad Derailment Factors Affecting Hazardous Materials Transportation Risk. *Transportation Research Record*, 1825, 64-74; Liu, X., Saat, M. R., and Barkan, C. P. L. (2012). Analysis of Causes of Major Train Derailment and Their Effect on Accident Rates. *Transportation Research Record*, 2289, 154-163.
+
+**(2) Asymmetric Impact Mitigation by PTC**
+
+Positive Train Control (PTC) is a system that detects and applies emergency braking for inter-train collisions caused by speeding or signal violations. It was legislated by the 2008 Rail Safety Improvement Act (RSIA) and fully implemented by the end of 2020 (FRA, 2020). PTC's core function is collision avoidance, but even when collisions cannot be fully prevented, it reduces actual impact speed below operating speed through emergency braking just before collision. Thus, even if a train was operating at high speed, the speed at the impact moment is already reduced, structurally yielding relatively fewer casualties relative to the recorded operating speed. In contrast, derailments are caused by rail defects, track geometry irregularities, or vehicle defects — and PTC cannot intervene in these accident types. Therefore, in derailment accidents, the kinetic energy of the operating speed is transferred without attenuation, so speed increase translates more directly into casualty increase. This asymmetric protective effect serves as one structural cause of the slope difference between the two accident types.
+
+**Citation:** Rail Safety Improvement Act of 2008, Pub. L. 110-432, 122 Stat. 4848 (2008); Federal Railroad Administration. (2020). *Positive Train Control (PTC) Implementation Status*. U.S. Department of Transportation.
+
+**(3) Differential KE Transfer Mechanism**
+
+Kinetic energy KE = (1/2)mv-squared is the physical basis of casualty occurrence in both collisions and derailments. However, the energy transfer pathway differs fundamentally by accident type. In collisions, KE is concentrated mainly at the impact contact point and transferred to a small number of cars within a short period. In contrast, in derailments, KE undergoes vehicle overturning, lateral rolling, and rolling processes, dispersing **sequentially and multidirectionally to many cars**. This dispersion process exposes more passengers to impact, and the higher the speed, the greater the total dispersed energy. Barkan et al. (2003) empirically demonstrated a positive relationship between the number of derailed cars and accident speed, supporting the mechanism by which casualties in derailments increase more substantially with higher speeds.
+
+**Citation:** Barkan, C. P. L., Dick, C. T., and Anderson, R. (2003). *op. cit.*
+
+### Expected Results
+
+**Beta_TRNSPD (main effect of speed): Positive (+), expected significant.**
+
+Train speed is predicted to have a positive (+) effect on casualty count regardless of accident type. Since kinetic energy (KE = (1/2)mv-squared) increases proportionally to the square of speed, higher speeds increase accident impact and thus injuries and fatalities. This applies to both derailment and collision and is the prerequisite for the interaction analysis (Barkan et al., 2003).
+
+**Beta_TYPE_GROUPCollision (main effect of accident type): Direction undetermined, possibly significant.**
+
+The main effect of accident type represents the baseline casualty difference between groups under low-speed conditions. The core of this hypothesis is the slope difference, not the intercept, so the direction of the main effect is not the target of hypothesis testing. However, considering that collision accidents occur frequently in passenger sections — yielding casualties even at low speeds — while derailments have limited impact at low speeds, the low-speed baseline may be higher for the collision group.
+
+**Beta_Collision:TRNSPD (key interaction): Negative (-), expected significant.**
+
+The central prediction is that the interaction coefficient takes a significantly negative (-) value. A negative interaction coefficient for the collision group means the collision speed-casualty slope is gentler than derailment, which is equivalent to the hypothesis (H_A) that **derailment's speed-casualty slope is steeper than collision's**. Three mechanisms support this. First, high-speed derailment increases the number of damaged cars through cascading deviation, while collision damage is localized to the impact contact point (Liu, 2016; Barkan et al., 2003). Second, PTC structurally reduces the collision group's speed-casualty conversion rate through emergency braking just before collision, but no equivalent intervention exists for derailment (RSIA, 2008). Third, in derailments, kinetic energy is multidirectionally dispersed across many cars, so speed increase exponentially expands the casualty exposure scale (Barkan et al., 2003).
+
+### Policy Implications
+
+If the interaction Beta_Collision:TRNSPD is confirmed as significantly negative (-), this statistically proves that the marginal effect of speed increase on casualty count is asymmetric by accident type.
+
+The current FRA speed regulation applies a uniform speed cap by track class without distinguishing speed sensitivity by accident type. However, if derailment's speed-casualty slope is significantly steeper than collision's, then speed reduction in segments with high derailment risk yields greater casualty reduction per unit speed decrease than in collision-risk segments. This serves as the basis for introducing risk-based regulation that identifies high-derailment-risk segments using rail defect frequency, curve radius, and roadbed condition, and applies differentiated speed caps to those segments. Furthermore, given that PTC already structurally mitigates the collision speed-casualty linkage while no equivalent technical safety net exists for derailment, FRA needs to prioritize parallel policies expanding automated track condition monitoring and early derailment warning systems.
+
+---
+
+## Hypothesis 4 (Casualties): Track Type x Train Speed (OpenLine vs YardType)
+
+### Hypothesis Statement
+
+$$H_0:\;\beta_{\text{TYPTRK\_GRP(YardType):TRNSPD}} = 0 \quad \text{(Speed effect is the same regardless of track type)}$$
+
+$$H_1:\;\beta_{\text{TYPTRK\_GRP(YardType):TRNSPD}} \neq 0 \quad \text{(Speed effect on casualties differs by track type)}$$
+
+### Theoretical Justification
+
+If this hypothesis proves statistically significant, the FRA can implement track-type-specific speed reduction policies:
+
+- **OpenLine (mainline/siding):** High-speed operation is inherently dangerous. The greater mass and speed typical of mainline operations mean that collision force and casualty potential are correspondingly greater (Liu et al., 2013). Therefore, policies should mandate speed governors or advanced positive train control (PTC) enforcement.
+- **YardType (yard/industrial):** Low-speed operation. According to the FRA's Switching Operations Fatality Analysis (SOFA, 2015), severe casualties in yards occur even at minimal speeds due to switching operations, crushing hazards, and slip/trip/falls. Therefore, policy focus should shift away from speed limits toward personnel training, ergonomic improvements, and procedural compliance (FRA, 2001).
+
+This targeted approach maximizes cost-effectiveness.
+
+**Citation:** Federal Railroad Administration. (2020). *Train Accident Data and Causal Factors: A Comprehensive Analysis 2010-2019*. Office of Safety Analysis.
+
+OpenLine and YardType differ in speed, personnel composition, and accident mechanisms.
+
+**Citation:** Kazaras, K., Amas, V., and Symeonidis, A. (2012). Classification of Accident Severity in Railway Transportation Systems: A Statistical and Bayesian Network Approach. *Transportation Research Record*, 2289, 83-91.
+
+### Justification for the Quadratic Speed Term I(TRNSPD^2) — Three Converging Lines of Evidence
+
+The quadratic speed term is incorporated in several models throughout this report. Its inclusion rests on three independent yet converging lines of evidence:
+
+1. **Physics-based (Domain Knowledge):** Train kinetic energy is E = (1/2)mv-squared, so collision destructive force grows proportionally to the square of speed. Therefore, casualties (and damage) are likely proportional to speed squared.
+
+   **Citation:** Anderson, D. L. (2018). Energy Absorption in Train-Vehicle Collisions: Physical Principles and Engineering Applications. *Transportation Safety Review*, 12(2), 34-52.
+
+2. **Visual Evidence (LOESS Smoothing):** When a LOESS curve is overlaid on the scatter of TRNSPD vs the response, the resulting line is curved (parabolic) rather than straight, indicating non-linearity.
+
+3. **Residual Diagnostics (Residual Pattern):** The residuals vs fitted values plot for the linear-only interaction model exhibits a U-shaped or inverted-U-shaped pattern — the classic signature of an omitted quadratic term.
+
+These three pieces of evidence — theoretical, visual, and statistical — converge on the same conclusion: the second-order model is justified. **This rationale is invoked in all subsequent models that include I(TRNSPD^2) and is not repeated.**
+
+### Expectation
+
+If the lines in the interaction plot show markedly different slopes, OpenLine and YardType exhibit different speed effects, supporting H1 (interaction exists). If the lines are nearly parallel, the speed effect is independent of track type, supporting H0 (no interaction). The initial visualization analysis serves as the basis for predicting the statistical significance of the interaction term Beta_4 in the subsequent linear regression.
+
+---
+
+## Hypothesis Visualization Summary
+
+The four hypotheses are visualized in their respective Problem 2 (ACCDMG) and Problem 3 (Casualties) analysis sections, where interaction plots and ggplot regression visualizations are constructed alongside the formal modeling. This approach keeps each hypothesis's visual evidence directly adjacent to its corresponding statistical test.
+
+---
+
+# Problem 2: ACCDMG Analysis (30 points)
+
+This section analyzes the two ACCDMG hypotheses. Per the project specification, the analysis is restricted to accidents with damages above the upper whisker (`df_accdmg`).
+
+## (a) Feature and Model Selection Techniques
+
+For both ACCDMG hypotheses, we follow a sequential model-building strategy:
+
+1. **Feature engineering** to construct hypothesis-relevant qualitative variables (LOCATION_TYPE, MEGA_TRAIN).
+2. **Main-effects model** to establish baseline behavior.
+3. **Interaction model** to test the hypothesized interaction.
+4. **Second-order model** adding I(TRNSPD^2) per the kinetic-energy rationale.
+5. **Box-Cox transformation** to address normality and homoscedasticity violations.
+6. **Centering** to address structural multicollinearity from polynomial and interaction terms.
+7. **Cross-validation** to verify out-of-sample predictive performance.
+
+## (b) Treatment of Ordinal and Categorical Variables
+
+- **LOCATION_TYPE** (Hypothesis 1): A binary factor derived from minimum great-circle distance to one of 25 major U.S. cities. Coded as `Urban (Accessible)` if within 200 km of a major city, otherwise `Isolated (Rural)`. This dichotomy reflects emergency response infrastructure availability.
+- **MEGA_TRAIN** (Hypothesis 2): A binary factor based on TOTAL_CARS (sum of freight/passenger/caboose plus all locomotives). Coded as `Yes` if total cars are greater than or equal to 100, otherwise `No`, reflecting the literature definition of "mega-trains" with cascading-pile-up risk.
+- **CARS** (Hypothesis 2 control): Numeric count of hazmat-loaded cars, retained on its original scale.
+- All factor variables use the first level as the reference category for interpretability.
+
+## (c) Model Assessment
+
+We assess models using:
+- **Adjusted R-squared** (penalized explanatory power)
+- **AIC** and **BIC** (information criteria; lower is better)
+- **Partial F-test** (nested model comparison)
+- **VIF** (multicollinearity)
+- **Residual diagnostics** (autoplot of residuals vs fitted, Q-Q, scale-location, leverage)
+- **Cross-validation PMSE** (out-of-sample predictive accuracy)
+
+## (d, e) Diagnosis and Adjustment
+
+For each hypothesis, untransformed models exhibited heavy right-skew, heteroscedasticity, and extreme outliers. We applied a Box-Cox transformation to ACCDMG (after handling non-positive values) to stabilize variance and approximate normality. Centering was applied to TRNSPD where polynomial and interaction terms produced VIF > 10. After these adjustments, residual diagnostics improved markedly and all coefficients of interest remained interpretable.
+
+---
+
+## Hypothesis 1 Analysis: Location Type x Train Speed
+
+### Feature Creation
+
+```{r acc1_feature_creation}
+# Reference list of major U.S. cities (top 25 by population)
+major_cities <- data.frame(
+  city = c("New York", "Chicago", "Los Angeles", "Houston", "Philadelphia",
+           "Phoenix", "San Antonio", "San Diego", "Dallas", "San Jose",
+           "Austin", "Jacksonville", "San Francisco", "Columbus", "Charlotte",
+           "Indianapolis", "Seattle", "Denver", "Washington D.C.", "Boston",
+           "Detroit", "Nashville", "Atlanta", "Miami", "Minneapolis"),
+  lat = c(40.71, 41.87, 34.05, 29.76, 39.95, 33.44, 29.42, 32.71, 32.77, 37.33,
+          30.26, 30.33, 37.77, 39.96, 35.22, 39.76, 47.60, 39.73, 38.90, 42.36,
+          42.33, 36.16, 33.74, 25.76, 44.97),
+  lon = c(-74.00, -87.62, -118.24, -95.36, -75.16, -112.07, -98.49, -117.16, -96.79, -121.88,
+          -97.74, -81.65, -122.41, -82.99, -80.84, -86.15, -122.33, -104.99, -77.03, -71.05,
+          -83.04, -86.78, -84.38, -80.19, -93.26)
+)
+
+# Compute minimum great-circle distance to nearest major city
+get_min_dist <- function(lon, lat, city_df) {
+  if (is.na(lon) | is.na(lat)) return(NA)
+  dists <- distHaversine(c(lon, lat), city_df[, c("lon", "lat")])
+  return(min(dists) / 1000)  # km
+}
+
+df_accdmg$dist_to_city <- mapply(get_min_dist,
+                                 df_accdmg$Longitud,
+                                 df_accdmg$Latitude,
+                                 MoreArgs = list(city_df = major_cities))
+
+# Define LOCATION_TYPE: 200 km radius threshold
+radius_threshold <- 200
+df_accdmg <- df_accdmg %>%
+  filter(!is.na(dist_to_city)) %>%
+  mutate(LOCATION_TYPE = ifelse(dist_to_city <= radius_threshold,
+                                "Urban (Accessible)",
+                                "Isolated (Rural)"),
+         LOCATION_TYPE = as.factor(LOCATION_TYPE))
+```
+
+**Feature engineering rationale:**
+
+- **Spatial distance computation:** Using actual latitude (Latitude) and longitude (Longitud) coordinates of the top 25 major U.S. cities, we computed the minimum spherical distance from each extreme accident location to the nearest city.
+- **Categorical derived variable (LOCATION_TYPE):** Based on the computed minimum distance, accidents within a 200 km radius of a city are classified as `Urban (Accessible)` (1), and those outside are classified as `Isolated (Rural)` (0). This new qualitative variable enters the interaction model.
+
+### Spatial Visualization
+
+```{r acc1_map}
+states_map <- map_data("state")
+
+ggplot() +
+  geom_polygon(data = states_map, aes(x = long, y = lat, group = group),
+               fill = "gray90", color = "white") +
+  geom_point(data = major_cities, aes(x = lon, y = lat),
+             color = "black", shape = 4, size = 3, stroke = 1.2) +
+  geom_point(data = df_accdmg,
+             aes(x = Longitud, y = Latitude, color = LOCATION_TYPE),
+             size = 2.5, alpha = 0.8) +
+  coord_fixed(1.3, xlim = c(-125, -65), ylim = c(24, 50)) +
+  scale_color_manual(values = c("Isolated (Rural)" = "tomato",
+                                "Urban (Accessible)" = "steelblue")) +
+  theme_minimal() +
+  labs(title = "Extreme Damage Accidents (Above Upper Whisker)",
+       subtitle = paste0("Categorized by Proximity to Major Cities (",
+                         radius_threshold, "km radius)"),
+       x = "Longitude", y = "Latitude", color = "Location Type") +
+  theme(legend.position = "bottom",
+        plot.title = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(color = "darkgray"))
+```
+
+**Map visualization analysis:** Based on the newly created spatial variable, extreme-damage accidents are visualized on a map of the continental United States. Rural (orange) and Urban (blue) accidents appear in roughly a 3:1 ratio. This suggests a high frequency of large accidents during high-speed operation on the long cross-country tracks (Rural) connecting major logistics hubs (Urban). Using this classified spatial data, we will construct the planned multiple linear regression interaction model and verify the statistical significance of the hypothesis.
+
+### Interaction Plot
+
+```{r acc1_interaction_plot}
+plot_data <- df_accdmg %>%
+  filter(!is.na(TRNSPD) & !is.na(ACCDMG) & ACCDMG > 0 & !is.na(LOCATION_TYPE))
+
+ggplot(plot_data, aes(x = TRNSPD, y = log(ACCDMG),
+                      color = LOCATION_TYPE, fill = LOCATION_TYPE)) +
+  geom_point(alpha = 0.4, size = 2) +
+  geom_smooth(method = "lm", se = TRUE, alpha = 0.2) +
+  scale_color_manual(values = c("Isolated (Rural)" = "tomato",
+                                "Urban (Accessible)" = "steelblue")) +
+  scale_fill_manual(values = c("Isolated (Rural)" = "tomato",
+                               "Urban (Accessible)" = "steelblue")) +
+  theme_minimal() +
+  labs(title = "Interaction Effect: Speed vs. Damage by Location Type",
+       subtitle = "Focusing on Extreme Damage Accidents (ACCDMG > Upper Whisker)",
+       x = "Train Speed (TRNSPD, mph)",
+       y = "Log of Accident Damage (log(ACCDMG))",
+       color = "Location Type",
+       fill = "Location Type") +
+  theme(legend.position = "bottom",
+        plot.title = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(color = "darkgray"))
+```
+
+The interaction plot confirms a notable interaction. As TRNSPD increases, the log(ACCDMG) value rises more sharply in rural areas, supporting the hypothesized direction.
+
+### Linear Models
+
+We first build models on untransformed Y to examine the raw signal.
+
+#### Main Effects Model
+
+```{r acc1_lm1}
+ACC2.lm1 <- lm(ACCDMG ~ LOCATION_TYPE + TRNSPD, data = df_accdmg)
+summary(ACC2.lm1)
+```
+
+**Speed effect (TRNSPD):** Coefficient approximately 17,595 with p-value highly significant (< 2e-16). Regardless of location, every 1-mph speed increase yields an average damage increase of about $17,595.
+
+**Location effect (LOCATION_TYPEUrban):** Coefficient 91,907 with p-value 0.00212 (significant). Compared to the rural baseline, urban accidents have an average baseline damage approximately $91,907 higher under the same speed. This indicates LOCATION_TYPE is significant but in the opposite direction from the hypothesis (urban damage appears larger).
+
+**Model explanatory power (R-squared):** Approximately 0.064 (6.4%), quite low. Many extreme outliers make a single linear model insufficient.
+
+#### Interaction Model
+
+```{r acc1_lm2}
+ACC2.lm2 <- lm(ACCDMG ~ LOCATION_TYPE * TRNSPD, data = df_accdmg)
+summary(ACC2.lm2)
+```
+
+**Interaction term:** Coefficient -1608, but p-value 0.31756 — far above 0.05 — so not statistically significant. From this model alone, there is no statistically meaningful difference in how speed increases damage between urban and rural settings.
+
+#### Second-Order Model
+
+The quadratic term is incorporated per the three converging lines of evidence (kinetic-energy physics, LOESS visual curvature, and U-shaped residual pattern) detailed in Hypothesis 4. We do not repeat the rationale here.
+
+```{r acc1_lm3}
+ACC2.lm3 <- lm(ACCDMG ~ LOCATION_TYPE * TRNSPD + I(TRNSPD^2), data = df_accdmg)
+summary(ACC2.lm3)
+```
+
+**Interpretation:**
+
+- **Quadratic term:** Coefficient 188.7 and p-value 7.36e-09. Damage grows exponentially with the square of speed, consistent with the kinetic energy law.
+- **Interaction term:** Now becomes significant (p = 0.02764). With the quadratic term properly absorbing the curvature, the urban-rural slope difference becomes detectable.
+
+A negative interaction coefficient for `LOCATION_TYPEUrban:TRNSPD` (-3,619.2) means that the speed-damage rise is significantly gentler in urban areas than in rural areas — supporting the hypothesis that **rural accidents have a steeper speed-damage curve**.
+
+### Partial F-Test
+
+```{r acc1_anova}
+anova(ACC2.lm1, ACC2.lm2, ACC2.lm3)
+```
+
+**Quadratic term physical proof:** I(TRNSPD^2) coefficient is 188.7 with p-value 7.36e-09 — highly significant. Derailment damage does not grow linearly with speed; it grows quadratically per kinetic energy E proportional to v-squared.
+
+**Interaction term:** In Model 2 (linear-only) the interaction p-value was 0.317 (not significant). After adding the quadratic term, the interaction p-value drops to 0.02764 (significant).
+
+### Model Comparison
+
+```{r acc1_model_compare}
+model_comparison <- data.frame(
+  Model = c("ACC2.lm1 (Main)", "ACC2.lm2 (Interaction)", "ACC2.lm3 (Second Order)"),
+  AdjR2 = round(c(summary(ACC2.lm1)$adj.r.squared,
+                  summary(ACC2.lm2)$adj.r.squared,
+                  summary(ACC2.lm3)$adj.r.squared), 5),
+  AIC   = round(c(AIC(ACC2.lm1), AIC(ACC2.lm2), AIC(ACC2.lm3)), 2),
+  BIC   = round(c(BIC(ACC2.lm1), BIC(ACC2.lm2), BIC(ACC2.lm3)), 2)
+)
+print(model_comparison)
+```
+
+ACC2.lm3 is preferred across all three indicators — Adjusted R-squared, AIC, and BIC. However, this comparison precedes model adequacy verification, so we now check residual diagnostics.
+
+### Model Diagnostics
+
+```{r acc1_diagnostics}
+autoplot(ACC2.lm3, which = c(1, 2, 3, 5), ncol = 2, label.size = 3) +
+  theme_bw() +
+  ggtitle("Diagnostics: ACC2.lm3 (Untransformed)")
+```
+
+Residual diagnostics reveal:
+
+- **Residuals vs Fitted:** Residuals concentrate near zero with a near-zero trend slope — linearity hard to judge.
+- **Normal Q-Q:** Right tail severely deviates — normality violated.
+- **Scale-Location:** Upward trend — homoscedasticity violated.
+- **Residuals vs Leverage:** Many extreme outliers with standardized residuals exceeding +-3.
+
+Normality and homoscedasticity violations together with multiple outliers indicate that the previous linear model statistics are unreliable. Therefore we apply a Box-Cox transformation.
+
+### Box-Cox Transformation
+
+```{r acc1_boxcox}
+bc_result <- boxcox(ACCDMG ~ LOCATION_TYPE * TRNSPD + I(TRNSPD^2),
+                    data = df_accdmg,
+                    lambda = seq(-2, 2, 1/10), plotit = TRUE)
+
+opt_lambda <- bc_result$x[which.max(bc_result$y)]
+cat("Optimal Lambda:", opt_lambda, "\n")
+
+df_accdmg$ACCDMG_trans <- ((df_accdmg$ACCDMG ^ opt_lambda) - 1) / opt_lambda
+
+ACC2_trans_m3 <- lm(ACCDMG_trans ~ LOCATION_TYPE * TRNSPD + I(TRNSPD^2),
+                    data = df_accdmg)
+```
+
+```{r acc1_diag_after}
+autoplot(ACC2_trans_m3, which = c(1, 2, 3, 5), ncol = 2, label.size = 3) +
+  theme_bw() +
+  ggtitle("Diagnostics: ACC2_trans_m3 (Transformed)")
+```
+
+**After Box-Cox transformation diagnostics:**
+
+After performing the Box-Cox transformation on the dependent variable (ACCDMG) and re-running residual diagnostics, the model's basic assumption violations were successfully resolved.
+
+- **Q-Q Plot:** The severe right-skew is resolved and residuals strongly approximate a normal distribution, satisfying the normality assumption.
+- **Residuals vs Fitted and Scale-Location:** Residual scatter has stabilized, showing heteroscedasticity is controlled.
+- **Leverage Plot:** Standardized residuals shrunk to normal range — extreme outliers' distorting influence eliminated.
+
+In conclusion, the transformed interaction model excellently satisfies the model adequacy assumptions. The p-values and regression coefficients from this model carry very high statistical reliability.
+
+### VIF Check and Centering
+
+```{r acc1_vif}
+vif(ACC2_trans_m3)
+
+# Centering to address structural multicollinearity
+df_accdmg$TRNSPD_c <- scale(df_accdmg$TRNSPD, center = TRUE, scale = FALSE)
+
+ACC2_trans_m3_c <- lm(ACCDMG_trans ~ LOCATION_TYPE * TRNSPD_c + I(TRNSPD_c^2),
+                      data = df_accdmg)
+
+vif(ACC2_trans_m3_c)
+summary(ACC2_trans_m3_c)
+```
+
+Multicollinearity arises structurally from interaction and quadratic terms. While not threatening model validity, we apply mean-centering for stricter analysis. After centering, multicollinearity is fully resolved while statistical significance is preserved.
+
+### Cross-Validation
+
+```{r acc1_cv}
+set.seed(2026)
+
+# Both models on same Y (transformed) and X (centered)
+cv_model2 <- glm(ACCDMG_trans ~ LOCATION_TYPE * TRNSPD_c,
+                 data = df_accdmg,
+                 family = gaussian)
+err_m2 <- cv.glm(df_accdmg, cv_model2, K = 10)
+
+cv_model3 <- glm(ACCDMG_trans ~ LOCATION_TYPE * TRNSPD_c + I(TRNSPD_c^2),
+                 data = df_accdmg,
+                 family = gaussian)
+err_m3 <- cv.glm(df_accdmg, cv_model3, K = 10)
+
+cat("=== 10-Fold Cross-Validation Error (PMSE) Comparison ===\n")
+cat("[Model 2 (no quadratic)] CV Error:", err_m2$delta[1], "\n")
+cat("[Model 3 (with quadratic)] CV Error:", err_m3$delta[1], "\n")
+```
+
+Model 3's CV error is lower than Model 2's, confirming that the second-order interaction model has superior predictive performance on new data.
+
+---
+
+## Hypothesis 2 Analysis: Mega Train x Train Speed (with CARS control)
+
+### Feature Creation (TOTAL_CARS and MEGA_TRAIN)
+
+```{r acc2_feature_creation}
+# True total car count including all locomotives
+df_accdmg$TOTAL_CARS <- rowSums(df_accdmg[, c(
+  "LOADF1", "EMPTYF1", "LOADP1", "EMPTYP1", "CABOOSE1",  # freight/passenger/caboose
+  "HEADEND1", "MIDMAN1", "MIDREM1", "RMAN1", "RREM1"     # all locomotives
+)], na.rm = TRUE)
+
+# Mega-train indicator (>=100 cars threshold from literature)
+df_accdmg$MEGA_TRAIN <- ifelse(df_accdmg$TOTAL_CARS >= 100, "Yes", "No")
+df_accdmg$MEGA_TRAIN <- as.factor(df_accdmg$MEGA_TRAIN)
+
+table(df_accdmg$MEGA_TRAIN)
+```
+
+The mega-train threshold is set at 100 cars per the literature. Since no single variable provides total car count, we sum the individual car-count columns (loaded freight, empty freight, passenger, caboose, all locomotives).
+
+### EDA: Distributions of Independent Variables
+
+```{r acc2_eda_distributions}
+p1 <- ggplot(df_accdmg, aes(x = TRNSPD)) +
+  geom_histogram(fill = "steelblue", color = "white", bins = 30) +
+  theme_minimal() +
+  labs(title = "Distribution of Train Speed", x = "Speed (MPH)", y = "Frequency")
+
+p2 <- ggplot(df_accdmg, aes(x = CARS)) +
+  geom_histogram(fill = "darkorange", color = "white", bins = 30) +
+  theme_minimal() +
+  labs(title = "Distribution of Hazmat Cars", x = "Number of Hazmat Cars", y = "Frequency")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+**1. Train Speed Distribution (left, blue):**
+
+- **Multi-modal distribution:** A primary peak at 0-10 MPH and a second gentler peak at 30-50 MPH.
+- **Low-speed segment:** Most train accidents occur during low-speed switching or yard operations.
+- **Mid-to-high-speed segment:** 30 MPH and above corresponds to actual mainline operation.
+- **Analytical implication:** Speed ranges widely from 0 to 80 MPH, providing sufficient variation to analyze its effect on damage.
+
+**2. Number of Hazmat Cars Distribution (right, orange):**
+
+- **Extreme right-skew:** Most data clusters near 0 with a very long right tail.
+- **Hazmat absence:** Many train accidents occur with zero or few hazmat cars.
+- **Long-tail "potential bomb":** Yet "unit train" accidents with 50 or even close to 100 hazmat cars exist.
+
+In summary: most accidents occur at low-speed/no-hazmat conditions, but rare high-speed/mega-train/hazmat-loaded accidents account for most total damage.
+
+### Damage Comparison by Train Size
+
+```{r acc2_box_train_size}
+p3 <- ggplot(df_accdmg, aes(x = MEGA_TRAIN, y = ACCDMG, fill = MEGA_TRAIN)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_y_log10(labels = scales::comma) +
+  theme_minimal() +
+  labs(title = "Accident Damage by Train Size (Log Scale)",
+       x = "Mega Train (>100 Total Cars)", y = "Damage ($)")
+
+print(p3)
+```
+
+By median, mega-train (Yes) accidents show larger damage scale, but the regular-train (No) group exhibits more extreme upper outliers. This suggests damage scale depends not only on train length but also on speed and environmental factors. Controlling for this variability via interaction analysis with speed and applying a log/Box-Cox transformation to the dependent variable is justified.
+
+### Speed vs Damage by Train Size (Hypothesis Visualization)
+
+```{r acc2_hypothesis_viz}
+p4 <- ggplot(df_accdmg, aes(x = TRNSPD, y = ACCDMG, color = MEGA_TRAIN)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = FALSE, linewidth = 1.2) +
+  theme_minimal() +
+  labs(title = "Damage vs. Speed by Train Size",
+       x = "Train Speed (MPH)", y = "Damage ($)", color = "Mega Train")
+
+print(p4)
+```
+
+**1. Group-wise trend slope difference (interaction evidence):**
+
+Comparing the regression curves of the two groups, the mega-train (Yes) group's slope rises more steeply than the regular-train (No) group's as speed increases. **Physical synergy:** This suggests that at low speeds, the damage difference by train size is minor, but at high speeds, mega-trains' enormous mass and inertia combine with speed to amplify damage scale.
+
+**2. Speed-segment damage analysis:**
+
+- **Low speed (0-25 MPH):** The two groups' regression lines nearly coincide, with most accidents clustered at low-damage levels — train length is not a critical variable for severity at low speeds.
+- **Mid-to-high speed (50-75 MPH):** Mega-trains' expected damage exceeds that of regular trains, and the gap widens. This visually supports the "Accordion-Style Pile-Up" theory — that residual cars' kinetic energy at high speeds cannot be controlled and causes cascading damage.
+
+**3. Distribution and outliers:**
+
+- **Extreme outliers:** Regular trains (No) show damage exceeding $30 million in some cases, interpreted as exceptional cases involving variables beyond train length (e.g., extreme operating speed).
+- **Data skewness:** Most data concentrates near zero in the lower region, suggesting statistical correction via variable transformation is needed rather than simple arithmetic mean.
+
+### Linear Models
+
+#### Main Effects Model
+
+```{r acc2_main}
+m2_main <- lm(ACCDMG ~ MEGA_TRAIN + TRNSPD + CARS, data = df_accdmg)
+summary(m2_main)
+```
+
+- **Speed (TRNSPD, beta = 17,009.9, p < 0.001):** Each 1-MPH speed increase adds about $17,010 average damage.
+- **Mega-train (MEGA_TRAINYes, beta = 74,308.9, p < 0.01):** Mega-trains generate about $74,309 additional baseline damage compared to regular trains.
+- **Hazmat cars (CARS, beta = 3,457.1, p < 0.001):** Each additional hazmat-loaded car adds $3,457 damage, demonstrating the fire-fuel-amplification effect.
+
+#### Interaction Model
+
+```{r acc2_int}
+m2_int <- lm(ACCDMG ~ MEGA_TRAIN * TRNSPD + CARS, data = df_accdmg)
+summary(m2_int)
+```
+
+**Interaction term (MEGA_TRAINYes:TRNSPD, beta = 10,481.7, p < 0.001):** p-value 1.39e-10 — extremely significant — with positive coefficient. This means: "compared to regular trains, mega-trains' damage increase per MPH at high speed is steeper by approximately $10,482." The destructive synergy of enormous mass and high speed is statistically validated.
+
+#### Second-Order Model
+
+```{r acc2_poly}
+m2_poly <- lm(ACCDMG ~ MEGA_TRAIN * TRNSPD + I(TRNSPD^2) + CARS, data = df_accdmg)
+summary(m2_poly)
+```
+
+- **Quadratic term I(TRNSPD^2), beta = 278.69, p < 0.001:** The quadratic term shows strong statistical significance. The linear TRNSPD p-value (0.173) loses significance.
+- **Adjusted R-squared:** 0.077 — highest among the three models.
+
+The quadratic curvature is unmistakably present. Despite this, the mega-train interaction (MEGA_TRAINYes:TRNSPD) maintains strong positive significance (p < 0.001), confirming model robustness.
+
+### Partial F-Test
+
+```{r acc2_anova}
+anova(m2_main, m2_int, m2_poly)
+```
+
+- **Model 1 vs Model 2 (interaction added):** F = 41.639, p = 1.159e-10. Adding the interaction explains additional variance significantly beyond pure main effects.
+- **Model 2 vs Model 3 (quadratic added):** F = 71.644, p < 2.2e-16. The kinetic-energy quadratic term improves the model dramatically.
+
+### Model Comparison
+
+```{r acc2_compare}
+model_comparison <- data.frame(
+  Model = c("m2_main (Main)", "m2_int (Interaction)", "m2_poly (Second Order)"),
+  AdjR2 = round(c(summary(m2_main)$adj.r.squared,
+                  summary(m2_int)$adj.r.squared,
+                  summary(m2_poly)$adj.r.squared), 5),
+  AIC   = round(c(AIC(m2_main), AIC(m2_int), AIC(m2_poly)), 2),
+  BIC   = round(c(BIC(m2_main), BIC(m2_int), BIC(m2_poly)), 2)
+)
+print(model_comparison)
+```
+
+The second-order model achieves the highest Adjusted R-squared (~7.8%) with the lowest AIC (254362.4) and BIC (254411.5), confirming its superiority.
+
+### Model Diagnostics
+
+```{r acc2_diag}
+autoplot(m2_poly, which = c(1, 2, 3, 5), ncol = 2, label.size = 3) +
+  theme_bw() +
+  ggtitle("Diagnostics: m2_poly (Untransformed)")
+```
+
+The same diagnostic violations seen in Hypothesis 1 are observed: normality and homoscedasticity violations and multiple outliers. Box-Cox transformation is applied next.
+
+### Box-Cox Transformation
+
+```{r acc2_boxcox}
+df_accdmg$ACCDMG_POS <- ifelse(df_accdmg$ACCDMG <= 0, 1, df_accdmg$ACCDMG)
+m2_poly_pos <- lm(ACCDMG_POS ~ MEGA_TRAIN * TRNSPD + I(TRNSPD^2) + CARS,
+                  data = df_accdmg)
+
+bc <- boxcox(m2_poly_pos, lambda = seq(-2, 2, by = 0.1))
+opt_lambda2 <- bc$x[which.max(bc$y)]
+cat("Optimal Lambda:", opt_lambda2, "\n")
+
+df_accdmg$ACCDMG_BC <- (df_accdmg$ACCDMG_POS ^ opt_lambda2 - 1) / opt_lambda2
+
+m2_poly_bc <- lm(ACCDMG_BC ~ MEGA_TRAIN * TRNSPD + I(TRNSPD^2) + CARS,
+                 data = df_accdmg)
+```
+
+```{r acc2_diag_after}
+autoplot(m2_poly_bc, which = c(1, 2, 3, 5), ncol = 2, label.size = 3) +
+  theme_bw() +
+  ggtitle("Diagnostics: m2_poly_bc (Transformed)")
+```
+
+After Box-Cox transformation, normality, homoscedasticity, and outlier influence are all controlled — confirming model adequacy.
+
+### VIF Check and Centering
+
+```{r acc2_vif}
+vif(m2_poly_bc)
+
+# Centering for cleaner multicollinearity
+df_accdmg$TRNSPD_c <- scale(df_accdmg$TRNSPD, center = TRUE, scale = FALSE)
+m2_poly_bc_c <- lm(ACCDMG_BC ~ MEGA_TRAIN * TRNSPD_c + I(TRNSPD_c^2) + CARS,
+                   data = df_accdmg)
+vif(m2_poly_bc_c)
+summary(m2_poly_bc_c)
+```
+
+Multicollinearity arises structurally from interaction and quadratic terms. While not threatening model validity, we apply mean-centering for stricter analysis. After centering, multicollinearity is fully resolved while statistical significance is preserved.
+
+### Cross-Validation
+
+```{r acc2_cv}
+set.seed(2026)
+
+cv_m2_no_int <- glm(ACCDMG_BC ~ MEGA_TRAIN + TRNSPD + I(TRNSPD^2) + CARS,
+                 data = df_accdmg,
+                 family = gaussian)
+err_m2_no_int <- cv.glm(df_accdmg, cv_m2_no_int, K = 10)
+
+cv_m2_poly <- glm(ACCDMG_BC ~ MEGA_TRAIN * TRNSPD + I(TRNSPD^2) + CARS,
+                  data = df_accdmg,
+                  family = gaussian)
+err_m2_poly <- cv.glm(df_accdmg, cv_m2_poly, K = 10)
+
+cat("=== 10-Fold Cross-Validation Error Comparison ===\n")
+cat("[Model 2 (no interaction)] CV Error:", err_m2_no_int$delta[1], "\n")
+cat("[Model 3 (with interaction)] CV Error:", err_m2_poly$delta[1], "\n")
+```
+
+The second-order model **with interaction** confirms superior out-of-sample predictive performance.
+
+---
+
+# Problem 3: Casualties Analysis (30 points)
+
+This section analyzes the two Casualties hypotheses. Per the project specification, the analysis is restricted to accidents with at least one casualty (`df_casualties`).
+
+## (a) Feature and Model Selection Techniques
+
+For both Casualties hypotheses, we follow a sequential model-building strategy parallel to the ACCDMG analysis:
+
+1. **Feature engineering** to construct hypothesis-relevant qualitative variables (TYPE_GROUP, TYPTRK_GRP).
+2. **Visualization** via interaction plots and ggplot regression visualizations.
+3. **Sequential modeling**: main-effects, interaction, second-order.
+4. **Box-Cox transformation** for variance stabilization.
+5. **Diagnostic verification** with attention to discrete count-data structure.
+6. **Bootstrap confidence intervals (R = 1,000)** as the primary inference tool, since OLS distributional assumptions are not met.
+7. **Cross-validation** for out-of-sample validation of the interaction term.
+
+## (b) Treatment of Ordinal and Categorical Variables
+
+- **TYPE_GROUP** (Hypothesis 3): Two-level factor recoding TYPE codes. `Derailment` keeps original; `HeadOn`, `Rearend`, `Side`, `Raking`, `BrokenTrain` are merged into `Collision`. Reference: `Derailment`.
+- **TYPTRK_GRP** (Hypothesis 4): Two-level factor recoding TYPTRK numeric codes. `OpenLine` = MainLine (1) + Siding (3); `YardType` = Yard (2) + Industry (4). Reference: `OpenLine`.
+- **TYPEQ** (Hypothesis 3 forward selection): Multi-level factor for train operation categories.
+- **PASSTRN** (Hypothesis 4 preprocessing): Filtered to valid `Freight`/`Passenger` levels, with NAs removed.
+
+## (c) Model Assessment
+
+Same suite as Problem 2: Adjusted R-squared, AIC, BIC, Partial F-test, VIF, residual diagnostics, plus Bootstrap 95% CI and 10-fold CV PMSE.
+
+## (d, e) Diagnosis and Adjustment
+
+Casualties is a discrete non-negative integer count with extreme right-skew. Even after Box-Cox transformation, perfect normality and homoscedasticity cannot be achieved due to the variable's inherent discreteness. We therefore rely on:
+
+- **Bootstrap CI** (distribution-free) as primary inference for interaction terms.
+- **Forward selection** to identify potential omitted-variable confounding (Hypothesis 3).
+- **Cross-validation** to verify whether interaction terms genuinely improve out-of-sample prediction.
+
+When OLS p-values, Bootstrap CIs, and CV all converge on the same conclusion, that conclusion is highly reliable.
+
+---
+
+## Hypothesis 3 Analysis: Accident Type x Train Speed (Derailment vs Collision)
+
+### Data Preparation
+
+```{r cas1_prep}
+df_cas1 <- df_casualties %>%
+  mutate(
+    TRNSPD = as.numeric(TRNSPD),
+    TYPE_GROUP = case_when(
+      as.character(TYPE) == "Derailment"                           ~ "Derailment",
+      as.character(TYPE) %in%
+        c("HeadOn", "Rearend", "Side", "Raking", "BrokenTrain")    ~ "Collision",
+      TRUE ~ NA_character_
+    ),
+    TYPE_GROUP = factor(TYPE_GROUP, levels = c("Derailment", "Collision"))
+  ) %>%
+  filter(!is.na(TYPE_GROUP), !is.na(TRNSPD), TRNSPD >= 0)
+
+cat("Analysis sample size:", nrow(df_cas1), "incidents\n")
+cat("  Derailment:", sum(df_cas1$TYPE_GROUP == "Derailment"), "\n")
+cat("  Collision :", sum(df_cas1$TYPE_GROUP == "Collision"), "\n")
+```
+
+For analysis we focus on derailment and collision only by creating the TYPE_GROUP variable. Derailment uses the existing TYPE label; collision merges the five sub-types HeadOn, Rearend, Side, Raking, and BrokenTrain into a single Collision group.
+
+### Step 1: Visualizing the Hypothesis
+
+#### Visual Evidence 1: Interaction Plot
+
+```{r cas1_interaction}
+Speed_cas1 <- cut(df_cas1$TRNSPD,
+                  c(min(df_cas1$TRNSPD, na.rm = TRUE),
+                    median(df_cas1$TRNSPD, na.rm = TRUE),
+                    max(df_cas1$TRNSPD, na.rm = TRUE)),
+                  include.lowest = TRUE,
+                  labels = c("Low Speed", "High Speed"))
+
+interaction.plot(Speed_cas1, df_cas1$TYPE_GROUP,
+                 df_cas1$Casualties,
+                 main = "Interaction: TYPE_GROUP x Speed on Casualties",
+                 xlab = "Speed Group",
+                 ylab = "Mean Casualties",
+                 col = c("steelblue", "darkorange"),
+                 lwd = 2,
+                 trace.label = "Type Group")
+
+cat("Median TRNSPD:", median(df_cas1$TRNSPD, na.rm = TRUE), "mph\n")
+```
+
+Using TRNSPD's median (15 mph) as the threshold, we split into Low Speed and High Speed and visualize mean casualties by accident type. The two groups' slopes are non-parallel, suggesting potential interaction between accident type and speed.
+
+#### Visual Evidence 2: Scatter Plot
+
+```{r cas1_scatter}
+ggplot(df_cas1, aes(x = TRNSPD, y = Casualties, colour = TYPE_GROUP)) +
+  geom_point(alpha = 0.2, size = 1) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 1.2) +
+  coord_cartesian(ylim = c(0, 20)) +
+  scale_colour_manual(values = c("Derailment" = "steelblue",
+                                 "Collision"  = "darkorange")) +
+  labs(title  = "Interaction: TYPE_GROUP x TRNSPD on Casualties",
+       x      = "Train Speed (mph)",
+       y      = "Casualties",
+       colour = "Type Group") +
+  theme_bw()
+```
+
+Continuous-speed regression lines by accident type. The two groups' slopes are not parallel, suggesting potential interaction.
+
+#### Visual Evidence 3: Speed-Bin Bar Chart
+
+```{r cas1_speedbin}
+df_cas1 <- df_cas1 %>%
+  mutate(SPD_BIN = cut(TRNSPD,
+                       breaks = c(0, 15, 30, 45, Inf),
+                       labels = c("0-15", "15-30", "30-45", "45+"),
+                       include.lowest = TRUE))
+
+cas1_bin_smry <- df_cas1 %>%
+  filter(!is.na(SPD_BIN)) %>%
+  group_by(TYPE_GROUP, SPD_BIN) %>%
+  summarise(Mean_Cas = mean(Casualties, na.rm = TRUE),
+            n        = n(), .groups = "drop")
+
+ggplot(cas1_bin_smry, aes(x = SPD_BIN, y = Mean_Cas, fill = TYPE_GROUP)) +
+  geom_col(position = "dodge") +
+  geom_text(aes(label = paste0("n=", n)),
+            position = position_dodge(width = 0.9),
+            vjust = -0.4, size = 3) +
+  scale_fill_manual(values = c("Derailment" = "steelblue",
+                               "Collision"  = "darkorange")) +
+  labs(title = "Mean Casualties by Speed Bin and Accident Type",
+       x     = "Speed Bin (mph)",
+       y     = "Mean Casualties",
+       fill  = "Type Group") +
+  theme_bw()
+```
+
+As speed bins rise, derailment's mean casualty increase outpaces collision's, providing descriptive support for the hypothesis direction.
+
+### Step 2: Y Distribution Check
+
+```{r cas1_ydist}
+ggplot(df_cas1, aes(x = Casualties)) +
+  geom_density(fill = "steelblue", alpha = 0.5) +
+  labs(title = "Distribution of Casualties",
+       x = "Casualties", y = "Density") +
+  theme_bw()
+```
+
+Casualties is a discrete non-negative integer with severe right-skew. Normality and homoscedasticity assumptions cannot be met; Box-Cox transformation will be considered.
+
+### Step 3: Linear Models
+
+We first build untransformed-Y linear models to examine variable significance.
+
+#### Main Effects Model
+
+```{r cas1_lm1}
+cas1.lm1 <- lm(Casualties ~ TYPE_GROUP + TRNSPD, data = df_cas1)
+summary(cas1.lm1)
+```
+
+- **Speed effect (TRNSPD):** Coefficient 0.3724 with p = 8.72e-06 — highly significant. Each 1 mph speed increase adds about 0.37 casualties on average regardless of accident type.
+- **Accident type effect (TYPE_GROUPCollision):** Coefficient -0.9967 with p = 0.750 — not significant. Controlling for speed, the baseline casualty difference between collision and derailment is not statistically distinguishable.
+- **Model R-squared:** ~2.7% — very low.
+
+#### Interaction Model
+
+```{r cas1_lm2}
+cas1.lm2 <- lm(Casualties ~ TYPE_GROUP * TRNSPD, data = df_cas1)
+summary(cas1.lm2)
+```
+
+- **Speed effect (TRNSPD):** Coefficient 0.45733 with p = 4.46e-06 — strongly significant. In the derailment (reference) group, each 1 mph adds ~0.46 casualties.
+- **Accident type effect (TYPE_GROUPCollision):** Coefficient 4.39119 with p = 0.343 — not significant. Low-speed intercept difference between collision and derailment is not statistically detected.
+- **Interaction term (TYPE_GROUPCollision:TRNSPD):** Coefficient -0.28828 — direction matches the hypothesis (negative) — but p = 0.114 — above 0.05. **Not statistically significant.**
+- **Adjusted R-squared:** ~2.9%.
+
+#### Partial F-Test
+
+```{r cas1_anova}
+anova(cas1.lm1, cas1.lm2)
+```
+
+Comparing main-effects model (cas1.lm1) and interaction model (cas1.lm2) yields F = 2.4995, p = 0.1143. p > 0.05, so the explanatory power gain from adding the interaction is not statistically significant; cas1.lm1 (main-effects only) is more parsimonious and adequate.
+
+#### Model Comparison
+
+```{r cas1_compare}
+data.frame(
+  Model  = c("cas1.lm1 (Main)", "cas1.lm2 (Interaction)"),
+  AdjR2  = round(c(summary(cas1.lm1)$adj.r.squared,
+                   summary(cas1.lm2)$adj.r.squared), 5),
+  AIC    = round(c(AIC(cas1.lm1), AIC(cas1.lm2)), 2),
+  BIC    = round(c(BIC(cas1.lm1), BIC(cas1.lm2)), 2)
+)
+```
+
+AIC slightly favors the interaction model by ~0.5 points, but Adjusted R-squared and BIC slightly favor the main-effects model. Together, the three indicators show that adding the interaction does not substantively improve the model.
+
+**However, since Casualties is discrete and no transformation has yet been applied, the residuals do not satisfy normality and homoscedasticity. Final judgment on interaction significance from this stage alone has limitations.**
+
+### Step 4: Model Diagnostics
+
+```{r cas1_diag}
+autoplot(cas1.lm2, which = c(1, 2, 3, 5), ncol = 2, label.size = 3) +
+  theme_bw() +
+  ggtitle("Diagnostics: cas1.lm2 (Untransformed)")
+```
+
+Residual diagnostics reveal:
+
+- **Residuals vs Fitted:** Residuals concentrate near 0 with upward-spike pattern — heteroscedasticity and linearity violations.
+- **Normal Q-Q:** Right tail severely deviates — normality violated.
+- **Scale-Location:** Upward trend — homoscedasticity violated.
+- **Residuals vs Leverage:** Many extreme outliers with standardized residuals exceeding +-3.
+
+Normality and homoscedasticity violations and multiple outliers are confirmed. Casualties is discrete, so no transformation can fully achieve normality, but Box-Cox stabilization is the closest approach to OLS assumptions.
+
+### Step 5: Box-Cox Transformation
+
+```{r cas1_boxcox}
+boxcox(cas1.lm2)
+L1 <- boxcox(cas1.lm2, plotit = FALSE)$x[
+        which.max(boxcox(cas1.lm2, plotit = FALSE)$y)]
+cat("Optimal lambda (L1):", round(L1, 3), "\n")
+```
+
+Optimal lambda is -1, applied as `(Y^L1 - 1) / L1`. Transformation formula: (Casualties^(-1) - 1) / (-1).
+
+```{r cas1_lm3}
+cas1.lm3 <- lm((Casualties^L1 - 1)/L1 ~ TYPE_GROUP * TRNSPD,
+               data = df_cas1)
+summary(cas1.lm3)
+```
+
+**Box-Cox transformation effect:** Adjusted R-squared improves from 0.02588 to 0.1415 (~5.5x increase). F-statistic also strengthens from 7.908 (p = 3.36e-05) to 43.86 (p < 2.2e-16). The Box-Cox transformation substantially corrects the extreme right-skew in the casualty distribution.
+
+- **Speed effect (TRNSPD):** Coefficient 0.0073 with p < 2e-16 — extremely strongly significant. In the derailment group, each 1 mph speed increase yields ~0.0073-unit transformed-casualty increase.
+- **Accident type effect (TYPE_GROUPCollision):** Coefficient 0.1065 with p = 0.00194 — significant. The accident type main effect, which was not significant before transformation (p = 0.343), becomes significant after Box-Cox. **This indicates the difference between the two groups is in intercept (low-speed baseline), not slope.**
+- **Interaction term (TYPE_GROUPCollision:TRNSPD):** Coefficient -0.0012381 — direction matches H_A (negative) — but p = 0.359 — not significant. Even after Box-Cox, the speed-casualty slope difference between collision and derailment is not statistically confirmed; H0 cannot be rejected. Coefficient direction matches the hypothesis, but the standard error is large enough that the confidence interval includes zero. Bootstrap testing follows for additional verification.
+
+```{r cas1_ydist_trans}
+ggplot(as.data.frame((df_cas1$Casualties^L1 - 1)/L1),
+       aes(x = (df_cas1$Casualties^L1 - 1)/L1)) +
+  geom_density(fill = "steelblue", alpha = 0.5) +
+  labs(title = paste0("Distribution of Box-Cox Transformed Casualties (L1 = ",
+                      round(L1, 2), ")"),
+       x = "(Casualties^L1 - 1) / L1", y = "Density") +
+  theme_bw()
+```
+
+The bimodal pattern after Box-Cox reflects Casualties' discrete-variable structure — a feature continuous-data transformations cannot resolve.
+
+```{r cas1_diag_lm3}
+autoplot(cas1.lm3, which = c(1, 2, 3, 5), ncol = 2, label.size = 3) +
+  theme_bw() +
+  ggtitle(paste0("Diagnostics: cas1.lm3 (Box-Cox L1 = ", round(L1, 2), ")"))
+
+cas1.lm3.log <- lm(log(Casualties) ~ TYPE_GROUP * TRNSPD, data = df_cas1)
+autoplot(cas1.lm3.log, which = c(1, 2, 3, 5), ncol = 2, label.size = 3) +
+  theme_bw() +
+  ggtitle("Log Transformation")
+```
+
+**Box-Cox (L1 = -1) diagnostics:**
+- **Residuals vs Fitted:** Two distinct stripe-patterns — the structural limit of discrete data; linearity hard to judge.
+- **Normal Q-Q:** Center is reasonable but right tail (473, 543, etc.) deviates — normality still violated, though improved over untransformed.
+- **Scale-Location:** Trend lines cross — full Homoscedasticity violated. However, residual range stabilizes substantially (-0.67 to 0.84) compared to untransformed (residual max 985).
+- **Residuals vs Leverage:** Most observations cluster at low leverage; no severe Cook's-distance influences.
+
+**Log transformation diagnostics:**
+- **Residuals vs Fitted:** Trend line distinctly downward — linearity violation.
+- **Normal Q-Q:** Right tail (473, 89, 576) shows standardized residuals > 5 — much more severe normality violation than Box-Cox.
+- **Scale-Location:** Trend line distinctly upward — Homoscedasticity violated.
+- **Residuals vs Leverage:** Standardized residuals exceeding +-3 plus high-leverage observations (609, 35, 598).
+
+**Comparison:** Box-Cox (L1 = -1) is superior to log in residual stability, normality, and homoscedasticity. We adopt cas1.lm3 as the final transformed model.
+
+### Multicollinearity assessment via VIF
+```{r}
+vif(cas1.lm3)
+```
+All VIF values are below 5 (TYPE_GROUP = 2.248, TRNSPD = 1.457, TYPE_GROUP:TRNSPD = 2.411), indicating no problematic multicollinearity.
+
+### Step 6: X Transformation Check
+
+Even after Box-Cox, residual issues remain. We test whether X (TRNSPD) non-linearity contributes.
+
+```{r cas1_xtrans}
+cas1.lm3.logx  <- lm((Casualties^L1 - 1)/L1 ~
+                       TYPE_GROUP * log(TRNSPD + 1), data = df_cas1)
+cas1.lm3.sqrtx <- lm((Casualties^L1 - 1)/L1 ~
+                       TYPE_GROUP * sqrt(TRNSPD),    data = df_cas1)
+
+model_comp <- cbind(
+  AIC(cas1.lm3, cas1.lm3.logx, cas1.lm3.sqrtx),
+  BIC = BIC(cas1.lm3, cas1.lm3.logx, cas1.lm3.sqrtx)$BIC
+)
+model_comp
+```
+
+Log and sqrt X transformations yield AIC and BIC higher than the original. X transformation does not improve the model, so residual issues stem from Y's (Casualties') discrete structure rather than X. We proceed without X transformation.
+
+### Step 7: Second-Order Term
+
+The kinetic-energy rationale (see Hypothesis 4) suggests speed may have a quadratic effect on casualties.
+
+```{r cas1_so}
+cas1.lm3.so <- lm((Casualties^L1 - 1)/L1 ~
+                    TYPE_GROUP * TRNSPD + I(TRNSPD^2),
+                  data = df_cas1)
+
+AIC(cas1.lm3, cas1.lm3.so)
+anova(cas1.lm3, cas1.lm3.so)
+```
+
+The second-order model's AIC is higher than the original, and the partial F-test is not significant. The quadratic term is not retained for this hypothesis (note: this contrasts with Hypothesis 4, where the quadratic term is retained — suggesting the kinetic-energy mechanism manifests differently across the two casualty groupings).
+
+### Step 8: Forward Selection
+
+**Purpose:** The hypothesis tests TYPE_GROUP x TRNSPD interaction. cas1.lm3's interaction p-value (0.359) is non-significant, but we cannot distinguish (i) a true null effect from (ii) interaction absorbed by an omitted confounder. AIC-based forward selection from a candidate pool {TYPE_GROUP * TRNSPD, I(TRNSPD^2), Cause, TYPEQ, TONS, TEMP} provides an objective, robust complement to single-model p-value reasoning. If the interaction is excluded after TYPEQ, TONS, etc. enter, omitted-variable bias is implicated.
+
+```{r cas1_forward, results='hide'}
+cas1.lm.null <- lm((Casualties^L1 - 1)/L1 ~ 1, data = df_cas1)
+
+cas1.lm.full <- lm((Casualties^L1 - 1)/L1 ~
+                     TYPE_GROUP * TRNSPD +
+                     I(TRNSPD^2) +
+                     Cause + TYPEQ + TONS + TEMP,
+                   data = df_cas1)
+
+cas1.lm.forward <- step(cas1.lm.null,
+                        scope     = list(lower = cas1.lm.null,
+                                         upper = cas1.lm.full),
+                        direction = "forward",
+                        trace     = FALSE)
+```
+
+```{r cas1_forward_summary}
+summary(cas1.lm.forward)
+AIC(cas1.lm3, cas1.lm.forward)
+
+autoplot(cas1.lm.forward, which = c(1, 2, 3, 5),
+         ncol = 2, label.size = 3) +
+  theme_bw() +
+  ggtitle("Forward Selection Final Model")
+
+vif(cas1.lm.forward)
+```
+
+**Forward Selection final model:** `(Casualties^L1 - 1)/L1 ~ TYPEQ + TRNSPD + TYPE_GROUP + TONS`
+
+**Critical observation:** the TYPE_GROUP:TRNSPD interaction is **not selected**.
+
+Two conclusions follow. First, speed (TRNSPD) and accident type (TYPE_GROUP) each have significant main effects on casualties, satisfying the hypothesis prerequisite. Second, the two variables' interaction lacks independent explanatory power. The interaction's drop-out after TYPEQ enters the model suggests the apparent slope difference may have been a spurious pattern arising in the absence of train-type control. Therefore, the failure to reject H0 (Beta_Collision:TRNSPD = 0) is consistently supported by two independent methods (cas1.lm3 p-value and forward selection).
+
+(All GVIF^(1/(2·Df)) values are well below 2.0 (TYPEQ = 1.032, TRNSPD = 1.113, TYPE_GROUP = 1.045, TONS = 1.272), indicating no multicollinearity concern among the predictors in the final forward-selected model.)
+
+### Step 9: Bootstrap Confidence Intervals
+
+Since all earlier models violated normality and homoscedasticity, distribution-based p-values and confidence intervals have limited reliability. Bootstrap, which resamples without distributional assumptions, is more appropriate here. Sample size (~hundreds) supports stable R = 1,000.
+
+**Bootstrap target:** `cas1.lm3` (Box-Cox interaction model). For H0: Beta_3 = 0 testing, we use the minimal model that includes the interaction.
+
+Coefficient roles:
+- Beta_0 (Intercept): baseline at Derailment & TRNSPD = 0
+- Beta_1 (TYPE_GROUPCollision): collision intercept difference
+- Beta_2 (TRNSPD): derailment (reference) speed slope
+- Beta_3 (TYPE_GROUPCollision:TRNSPD): collision additional speed slope <- **key**
+
+Beta_3 < 0 means collision's speed slope is gentler than derailment's, i.e., **derailment casualties grow faster with speed**.
+
+```{r cas1_boot}
+boot1.fn <- function(data, index) {
+  fit <- lm((Casualties^L1 - 1)/L1 ~ TYPE_GROUP * TRNSPD,
+            data = data[index, ])
+  coef(fit)
+}
+
+set.seed(415)
+boot1.result <- boot(df_cas1, boot1.fn, R = 1000)
+
+cat("Coefficient names:\n")
+print(names(boot1.result$t0))
+boot1.result
+```
+
+```{r cas1_boot_ci}
+coef_names <- names(boot1.result$t0)
+idx_b0     <- which(coef_names == "(Intercept)")
+idx_b1     <- which(coef_names == "TYPE_GROUPCollision")
+idx_b2     <- which(coef_names == "TRNSPD")
+idx_b3     <- which(coef_names == "TYPE_GROUPCollision:TRNSPD")
+
+ci1_b0 <- boot.ci(boot1.result, index = idx_b0, type = "perc")
+ci1_b1 <- boot.ci(boot1.result, index = idx_b1, type = "perc")
+ci1_b2 <- boot.ci(boot1.result, index = idx_b2, type = "perc")
+ci1_b3 <- boot.ci(boot1.result, index = idx_b3, type = "perc")
+
+boot1_summary <- data.frame(
+  Term     = c("Beta_0 (Intercept)",
+               "Beta_1 (TYPE_GROUPCollision)",
+               "Beta_2 (TRNSPD)",
+               "Beta_3 (Collision:TRNSPD)"),
+  Estimate = round(boot1.result$t0, 5),
+  CI_lower = round(c(ci1_b0$percent[4], ci1_b1$percent[4],
+                     ci1_b2$percent[4], ci1_b3$percent[4]), 5),
+  CI_upper = round(c(ci1_b0$percent[5], ci1_b1$percent[5],
+                     ci1_b2$percent[5], ci1_b3$percent[5]), 5)
+)
+boot1_summary
+```
+
+```{r cas1_conclusion}
+b3_row   <- boot1_summary[boot1_summary$Term == "Beta_3 (Collision:TRNSPD)", ]
+b3_est   <- b3_row$Estimate
+b3_lower <- b3_row$CI_lower
+b3_upper <- b3_row$CI_upper
+
+contains_zero <- b3_lower <= 0 & b3_upper >= 0
+contains_neg  <- b3_upper < 0
+
+cat("Key interaction: TYPE_GROUPCollision:TRNSPD (Beta_3)\n")
+cat(sprintf("  Estimate = %.5f\n", b3_est))
+cat(sprintf("  95%% Bootstrap CI: [%.5f, %.5f]\n", b3_lower, b3_upper))
+
+if (contains_zero) {
+cat("\n=> CI contains 0: cannot reject H0.\n",
+"  Speed-sensitivity difference cannot be statistically established.\n")
+} else {
+cat("\n=> CI does not contain 0: reject H0.\n",
+"  Speed-sensitivity differs significantly between Collision and Derailment.\n")
+}
+```
+
+The Bootstrap 95% CI for Beta_3 (Collision:TRNSPD) **contains 0**, so we cannot reject H0. This confirms what was already suggested: collision's lower speed sensitivity (relative to derailment, the reference) cannot be established statistically. This conclusion aligns consistently with the earlier analyses — cas1.lm3's interaction p-value (0.359), the partial F-test (p = 0.114), and the forward-selection exclusion of the interaction all point to the same direction.
+
+### Step 10: 10-Fold Cross-Validation
+
+To validate the Bootstrap conclusion from a predictive-performance perspective, we run 10-fold cross-validation. CV measures prediction error directly via data partitioning and is fully independent of normality/homoscedasticity assumptions.
+
+```{r cas1_cv}
+set.seed(415)
+
+cv_cas1.A <- glm((Casualties^L1 - 1)/L1 ~ TYPE_GROUP + TRNSPD,
+                  data   = df_cas1,
+                  family = gaussian)
+
+cv_cas1.B <- glm((Casualties^L1 - 1)/L1 ~ TYPE_GROUP * TRNSPD,
+                  data   = df_cas1,
+                  family = gaussian)
+
+err_cas1.A <- cv.glm(df_cas1, cv_cas1.A, K = 10)$delta[1]
+err_cas1.B <- cv.glm(df_cas1, cv_cas1.B, K = 10)$delta[1]
+
+cat("=== 10-Fold CV PMSE Comparison ===\n")
+cat(sprintf("[Model A] Main effects only      : PMSE = %.6f\n", err_cas1.A))
+cat(sprintf("[Model B] With interaction       : PMSE = %.6f\n", err_cas1.B))
+cat(sprintf("PMSE change (B - A)              : %+.6f\n", err_cas1.B - err_cas1.A))
+
+cv_results <- data.frame(
+  Model = c("Model A\nMain effects only\n(TYPE_GROUP + TRNSPD)",
+            "Model B\nWith interaction\n(TYPE_GROUP * TRNSPD)"),
+  PMSE  = c(err_cas1.A, err_cas1.B)
+)
+
+ggplot(cv_results, aes(x = Model, y = PMSE, fill = Model)) +
+  geom_bar(stat = "identity", width = 0.4) +
+  geom_text(aes(label = sprintf("%.5f", PMSE)),
+            vjust = -0.5, size = 4) +
+  scale_fill_manual(values = c("steelblue", "tomato")) +
+  labs(title    = "10-Fold CV PMSE Comparison",
+       subtitle = "Does adding an interaction improve predictive performance?",
+       x = NULL, y = "CV PMSE") +
+  theme_bw() +
+  theme(plot.title    = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        legend.position = "none")
+```
+
+**10-Fold CV results:** Model A (main effects only) shows CV PMSE = 0.094683, Model B (with interaction) shows CV PMSE = 0.094899. Adding the interaction increases PMSE by +0.000217 — actually slightly worsening prediction. The 0.23% PMSE difference is essentially negligible, indicating the interaction term contributes no real information. This may reflect overfitting to training-data noise; the simpler model without interaction is at least as good in prediction.
+
+**Synthesis:** This 10-fold CV result fully aligns with the Bootstrap 95% CI ([-0.00409, 0.00179] containing 0) and the Forward Selection (interaction excluded). Three independent methods, robustly free of residual assumptions, all converge on the same direction. The conclusion of failing to reject H0 (Beta_Collision:TRNSPD = 0) is strongly supported.
+
+### Step 11: Robustness Check — Poisson GLM
+As a supplementary analysis, we fit a Poisson GLM to examine whether the conclusions hold under a theoretically more appropriate count-data model (per GLM framework; see lecture notes). 
+
+Note that Casualties is a discrete count variable, and as introduced in lecture, Poisson GLM with log(E[Y]) link function is theoretically more appropriate than Box-Cox OLS — as it assumes Poisson-distributed residuals (Var(Y) = E[Y]) rather than constant variance independent of E[Y].
+```{r}
+# Poisson GLM
+cas1.glm <- glm(Casualties ~ TYPE_GROUP * TRNSPD,
+                family = poisson(link = "log"),
+                data   = df_cas1)
+
+summary(cas1.glm)
+```
+```{r}
+# Create new data for prediction
+speed_range1 <- seq(min(df_cas1$TRNSPD, na.rm=TRUE),
+                    max(df_cas1$TRNSPD, na.rm=TRUE),
+                    length.out = 100)
+
+newdata_glm1 <- expand.grid(
+  TRNSPD     = speed_range1,
+  TYPE_GROUP = c("Derailment", "Collision")
+)
+
+# GLM Forecast
+newdata_glm1$pred <- predict(cas1.glm,
+                             newdata = newdata_glm1,
+                             type = "response")
+
+# OLS vs GLM Comparison Graph
+ggplot(df_cas1, aes(x = TRNSPD, y = Casualties,
+                    color = TYPE_GROUP)) +
+  geom_point(alpha = 0.2, size = 1) +
+  # OLS line
+  geom_smooth(method = "lm", se = FALSE,
+              linetype = "dashed", size = 1) +
+  # GLM line
+  geom_line(data = newdata_glm1,
+            aes(x = TRNSPD, y = pred,
+                color = TYPE_GROUP),
+            size = 1.2) +
+  coord_cartesian(ylim = c(0, 20)) +
+  scale_color_manual(values = c("Derailment" = "steelblue",
+                                "Collision"  = "darkorange")) +
+  labs(
+    title    = "OLS vs Poisson GLM: Speed-Casualty Relationship",
+    subtitle = "Dashed = OLS, Solid = Poisson GLM",
+    x        = "Train Speed (mph)",
+    y        = "Casualties",
+    color    = "Type Group"
+  ) +
+  theme_bw() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+As observed in the plot, Collision (orange) observations are concentrated at low speeds (below 25 mph) with a relatively flat pattern at higher speeds.
+
+The Poisson GLM, however, extrapolates the slight upward trend from Collision's low-speed region into an exponential increase at high speeds — misrepresenting the actual flat high-speed pattern.
+
+the GLM's strong interaction significance (p = 2.76e-13) is likely inflated by extrapolation artifacts arising from the sparsity of Collision high-speed observations, rather than 
+reflecting a genuine differential speed effect.
+
+Returning to the three independent conclusions derived earlier:
+
+> **Bootstrap, CV, and Forward Selection 
+> all agree:** the interaction term is not 
+> statistically significant.
+
+**We therefore fail to reject the null hypothesis.**
+---
+
+## Hypothesis 4 Analysis: Track Type x Train Speed (OpenLine vs YardType)
+
+### Data Preprocessing
+
+```{r cas2_prep}
+df_casualties <- df_casualties %>%
+  mutate(
+    TRNSPD    = as.numeric(TRNSPD),
+    TONS      = as.numeric(TONS),
+    CARS      = as.numeric(CARS),
+    CARSHZD   = as.numeric(CARSHZD),
+    HZD_RATIO = CARSHZD / (CARS + 1),
+
+    PASSTRN   = ifelse(PASSTRN %in% c("N", "Y"), PASSTRN, NA),
+    PASSTRN   = factor(PASSTRN,
+                       levels = c("N", "Y"),
+                       labels = c("Freight", "Passenger")),
+
+    # MainLine(1) + Siding(3) -> OpenLine
+    # Yard(2) + Industry(4) -> YardType
+    TYPTRK_GRP = factor(case_when(
+      TYPTRK %in% c(1, 3) ~ "OpenLine",
+      TYPTRK %in% c(2, 4) ~ "YardType",
+      TRUE                ~ NA_character_
+    ))
+  ) %>%
+  filter(!is.na(TYPTRK_GRP)) %>%
+  filter(!is.na(PASSTRN))
+
+cat("Data preprocessing complete:\n")
+cat("  Rows after filtering:", nrow(df_casualties), "\n")
+print(table(df_casualties$TYPTRK_GRP))
+```
+
+**Preprocessing rationale:**
+
+1. **TYPTRK_GRP grouping justification:**
+   - **OpenLine** (MainLine + Siding): high-speed main operation, public tracks, diverse speeds.
+   - **YardType** (Yard + Industry): low-speed yard operation, worker-centered, standardized procedures.
+   
+   **Citation:** Kazaras et al. (2012). *Transportation Research Record*, 2289, 83-91.
+
+2. **Result:** ~3,982 incidents after filtering.
+
+### Speed Categorization
+
+```{r cas2_speed_cat}
+Speed_cas <- cut(df_casualties$TRNSPD,
+                 breaks = c(min(df_casualties$TRNSPD, na.rm = TRUE),
+                           median(df_casualties$TRNSPD, na.rm = TRUE),
+                           max(df_casualties$TRNSPD, na.rm = TRUE)),
+                 include.lowest = TRUE,
+                 labels = c("Low Speed", "High Speed"))
+
+cat("Speed categorization:\n")
+cat("  Min TRNSPD:", min(df_casualties$TRNSPD, na.rm = TRUE), "mph\n")
+cat("  Median TRNSPD:", median(df_casualties$TRNSPD, na.rm = TRUE), "mph\n")
+cat("  Max TRNSPD:", max(df_casualties$TRNSPD, na.rm = TRUE), "mph\n")
+```
+
+### Interaction Plot
+
+```{r cas2_interaction}
+interaction.plot(
+  x.factor = Speed_cas,
+  trace.factor = df_casualties$TYPTRK_GRP,
+  response = df_casualties$Casualties,
+  main = "Interaction: Track Type x Speed on Casualties",
+  xlab = "Speed Category",
+  ylab = "Mean Casualties",
+  col = c("red", "blue"),
+  lwd = 2,
+  legend = TRUE
+)
+```
+
+**Interaction Plot Interpretation:**
+
+1. **Slope differences:** Compare OpenLine (red) and YardType (blue) slopes from low to high speed.
+2. **Parallelism review:** Parallel lines suggest no interaction (H0 supported); crossing or non-parallel lines suggest interaction (H1 supported).
+
+### ggplot Scatterplot with Regression Lines
+
+```{r cas2_ggplot}
+ggplot(data = df_casualties, aes(x = TRNSPD, y = Casualties, colour = TYPTRK_GRP)) +
+  geom_point(alpha = 0.4, size = 2) +
+  geom_smooth(method = "lm", se = TRUE) +
+  coord_cartesian(ylim = c(0, 20)) +
+  labs(
+    title = "Hypothesis 4: Track Type x Train Speed Interaction on Casualties",
+    subtitle = "Regression lines by OpenLine vs YardType",
+    x = "Train Speed (mph)",
+    y = "Casualties (injuries + fatalities)",
+    colour = "Track Type"
+  ) +
+  theme_bw() +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        legend.position = "bottom")
+```
+
+**Scatterplot interpretation:**
+
+1. **Regression slope comparison:** OpenLine (red) shows a relatively gentle slope; YardType (blue) shows a steeper or comparable slope.
+2. **Confidence bands:** Wide gray bands indicate high variability or small samples; narrow bands indicate consistent data. **Citation:** Harrell Jr (2015). *Regression Modeling Strategies* (2nd ed.). Springer.
+3. **Y-axis limit rationale:** ylim = c(0, 20) excludes extreme outliers (500+ casualties) to clarify regression slopes. **Citation:** Fox & Weisberg (2016). *An R Companion to Applied Regression* (3rd ed.). SAGE.
+
+### Step 1: Y Distribution Check
+
+```{r cas2_y_dist}
+ggplot(df_casualties, aes(Casualties)) +
+  geom_density() +
+  labs(title = "Distribution of Casualties") +
+  theme_bw()
+```
+
+The distribution of Casualties is extremely right-skewed:
+
+- Most values concentrate in 0-50 range.
+- Extreme outliers: some incidents with hundreds to thousands of casualties.
+- Mean << median (typical count-data characteristic).
+
+This severely violates the linear regression normality assumption and signals the need for variance-stabilizing transformation.
+
+### Step 2: Build Base Models
+
+#### Step 2-1: Main Effects Model
+
+```{r cas2_lm1}
+cas.lm1 <- lm(Casualties ~ TYPTRK_GRP + TRNSPD,
+              data = df_casualties)
+summary(cas.lm1)
+```
+
+**Results:**
+- **TYPTRK_GRPYardType (p = 0.715):** not significant — no difference in mean casualties between OpenLine and YardType.
+- **TRNSPD (p = 0.043):** significant — but each 1 mph yields only +0.030 casualties (trivial).
+- **Adjusted R-squared = 0.001076:** very low explanatory power.
+
+**Conclusion:** Main effects alone are insufficient. Track type itself is unimportant; speed's linear effect is weak.
+
+#### Step 2-2: Add Interaction
+
+```{r cas2_lm2}
+cas.lm2 <- lm(Casualties ~ TYPTRK_GRP * TRNSPD,
+              data = df_casualties)
+summary(cas.lm2)
+
+anova(cas.lm1, cas.lm2)
+AIC(cas.lm1, cas.lm2)
+cat("Model 1 Adj.R^2:", summary(cas.lm1)$adj.r.squared, "\n")
+cat("Model 2 Adj.R^2:", summary(cas.lm2)$adj.r.squared, "\n")
+```
+
+**Key results:**
+
+- **TYPTRK_GRPYardType (p = 0.082):** borderline significant.
+- **TRNSPD (p = 0.078):** borderline significant.
+- **TYPTRK_GRPYardType:TRNSPD (p = 0.026):** **significant** — interaction exists.
+- **Adjusted R-squared = 0.00207:** 17% relative improvement.
+- **AIC 35005.42:** 3 points lower than Model 1.
+- **Partial F-test (Model 2 vs Model 1):** F = 4.96, p = 0.026 — interaction explains significant variance.
+
+**Interpretation:** The combined effect of track type and speed is more meaningful than individual effects. YardType shows a different speed impact than OpenLine.
+
+
+#### Step 2-3: Add Quadratic Term
+
+The quadratic-term rationale (kinetic energy + LOESS visual + U-shaped residuals) is the same convergent justification stated in the Hypothesis 4 statement section above.
+
+```{r cas2_lm3}
+cas.lm2.so <- lm(Casualties ~ TYPTRK_GRP * TRNSPD + I(TRNSPD^2),
+                 data = df_casualties)
+summary(cas.lm2.so)
+
+anova(cas.lm2, cas.lm2.so)
+AIC(cas.lm2, cas.lm2.so)
+cat("Model 2 Adj.R^2:", summary(cas.lm2)$adj.r.squared, "\n")
+cat("Model 3 Adj.R^2:", summary(cas.lm2.so)$adj.r.squared, "\n")
+```
+
+**Key results:**
+
+- **I(TRNSPD^2) (p = 0.003):** highly significant.
+- **TYPTRK_GRPYardType:TRNSPD (p = 0.00599):** significant — interaction persists.
+- **Adjusted R-squared = 0.00398:** 92% improvement over Model 2.
+- **AIC 34998.78:** 7 points lower (strong improvement).
+- **Partial F-test (Model 2 vs Model 3):** F = 8.64, p = 0.0033.
+
+### Visual Justification for Quadratic Term (Reference)
+
+```{r cas2_loess}
+ggplot(df_casualties, aes(x = TRNSPD, y = Casualties)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "loess", color = "blue") +
+  labs(title = "Train Speed vs Casualties",
+       x = "Train Speed (TRNSPD)",
+       y = "Casualties")
+
+df_casualties$resid_lm2 <- resid(cas.lm2)
+
+ggplot(df_casualties, aes(x = TRNSPD, y = resid_lm2)) +
+  geom_point(alpha = 0.3) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_smooth(method = "loess", color = "red") +
+  labs(title = "Residuals of cas.lm2 vs Train Speed",
+       x = "Train Speed",
+       y = "Residuals")
+```
+
+The LOESS curvature and U-shaped residual pattern visually corroborate the quadratic structure that the kinetic-energy physics predicts.
+
+### Step 3: Model Diagnostics (Untransformed Second-Order Model)
+
+```{r cas2_diag}
+autoplot(cas.lm2.so, which = c(1, 2, 3, 5), ncol = 2, label.size = 3) +
+  theme_bw()
+```
+
+**Diagnostic observations:**
+
+1. **Residuals vs Fitted:** Extreme outliers (obs 303: residual ~50). Not centered around zero. Severe heteroscedasticity.
+2. **Normal Q-Q:** Right tail completely deviates. Extreme outliers visible.
+3. **Scale-Location:** Upward trend. Homoscedasticity violated.
+4. **Residuals vs Leverage:** Standardized residuals far exceed +-3 (e.g., obs 303, 1965, 2486). Leverage low — these are outliers, not high-influence points.
+
+### Step 4: Box-Cox Transformation Selection
+
+```{r cas2_boxcox}
+boxcox(cas.lm2.so)
+
+L <- boxcox(cas.lm2.so, plotit = FALSE)$x[
+       which.max(boxcox(cas.lm2.so, plotit = FALSE)$y)]
+cat("Optimal lambda =", L, "\n")
+
+cas.lm2.so.box <- lm((Casualties^L - 1)/L ~
+                      TYPTRK_GRP * TRNSPD + I(TRNSPD^2),
+                    data = df_casualties)
+summary(cas.lm2.so.box)
+```
+
+**Transformed model:** (Casualties^(-1.5) - 1) / (-1.5) ~ TYPTRK_GRP * TRNSPD + I(TRNSPD^2)
+
+**Dramatic improvements:**
+- **Adjusted R-squared:** 0.00398 -> 0.02206 (5.5x increase, 10x absolute improvement).
+- **F-statistic:** 23.45 (p < 2.2e-16) — model overall highly significant.
+- **Residual Standard Error:** 19.61 -> 0.2434 (80% reduction).
+
+**Coefficients (transformed scale):**
+- **TYPTRK_GRPYardType (p < 0.001):** significant — YardType has lower baseline casualties.
+- **I(TRNSPD^2) (p = 0.0204):** significant — non-linear speed effect exists.
+- **TYPTRK_GRPYardType:TRNSPD (p = 0.029):** significant — interaction remains.
+
+### Step 5: Diagnostics After Transformation
+
+```{r cas2_diag_after}
+autoplot(cas.lm2.so, which = c(1, 2, 3, 5),
+         ncol = 2, label.size = 3) +
+  theme_bw() + ggtitle("Before Box-Cox")
+
+autoplot(cas.lm2.so.box, which = c(1, 2, 3, 5),
+         ncol = 2, label.size = 3) +
+  theme_bw() + ggtitle("Box-Cox")
+
+cas.lm2.log <- lm(log(Casualties) ~ TYPTRK_GRP * TRNSPD + I(TRNSPD^2),
+                  data = df_casualties)
+autoplot(cas.lm2.log, which = c(1, 2, 3, 5), ncol = 2, label.size = 3) +
+  theme_bw() +
+  ggtitle("Log Transformation")
+```
+
+**Before transformation issues:**
+1. Residuals vs Fitted: extreme outliers (obs 306, residual ~50), severe heteroscedasticity.
+2. Normal Q-Q: right tail completely deviates.
+3. Scale-Location: upward trend.
+4. Residuals vs Leverage: standardized residuals exceed +-3.
+
+**After transformation improvements:**
+1. Residuals vs Fitted: residuals balanced around zero, outlier effects mitigated.
+2. Normal Q-Q: central quantiles follow theoretical line, both tails substantially improved.
+3. Scale-Location: LOESS slope steeper — homoscedasticity improvement limited.
+4. Residuals vs Leverage: most within +-2, outlier influence reduced.
+
+#### QQ Plot Step Pattern Note
+
+The step-like pattern in the Normal Q-Q plot reflects Casualties' discrete (integer-only) nature. This is normal for discrete data and not a defect. The improvement in extreme right-tail deviation is the critical Box-Cox success.
+
+**Citation:** Hosmer Jr et al. (2013). *Applied Logistic Regression* (3rd ed.). Wiley.
+
+### Step 6: Multicollinearity (VIF) Assessment
+
+```{r cas2_vif}
+vif(cas.lm2.so.box)
+
+df_casualties$TRNSPD_c <- df_casualties$TRNSPD -
+                          mean(df_casualties$TRNSPD, na.rm = TRUE)
+
+cas.lm2.so.box.c <- lm((Casualties^L - 1)/L ~
+                     TYPTRK_GRP * TRNSPD_c + I(TRNSPD_c^2),
+                   data = df_casualties)
+
+vif(cas.lm2.so.box.c)
+```
+
+**VIF results:**
+- TRNSPD: 13.64
+- I(TRNSPD^2): 11.90
+- Interaction: 1.94
+
+**Interpretation:** VIF > 10 for polynomial terms is structurally expected. Coefficient estimates remain unbiased; p-values for the quadratic and interaction terms are not affected by multicollinearity. Centering attempt actually inflates TYPTRK_GRP VIF due to interaction structure, so we maintain original scale and document the limitation.
+
+**Citation:** Fox & Weisberg (2016). *An R Companion to Applied Regression*. SAGE.
+
+**Final model:** cas.lm2.so.box adopted.
+
+### Step 7: Transformed Y Distribution
+
+```{r cas2_y_trans}
+ggplot(as.data.frame((df_casualties$Casualties^L - 1)/L),
+       aes((df_casualties$Casualties^L - 1)/L)) +
+  geom_density() +
+  labs(title = "Distribution After Box-Cox Transformation (lambda = -1.5)")
+```
+
+The bimodal pattern reflects Casualties' discrete-integer structure. No transformation can produce perfect normality, but Box-Cox (lambda = -1.5) achieves the best AIC (55.76) and 10x Adjusted R-squared improvement among alternatives, so we adopt it.
+
+### Step 8: X Transformation Exploration
+
+```{r cas2_x_trans}
+ggplot(df_casualties, aes(x = TRNSPD)) +
+  geom_histogram(bins = 50) +
+  labs(title = "Distribution of TRNSPD") +
+  theme_bw()
+
+cas.lm3.logx <- lm((Casualties^L - 1)/L ~
+                   TYPTRK_GRP * log(TRNSPD + 1),
+                   data = df_casualties)
+
+cas.lm3.sqrtx <- lm((Casualties^L - 1)/L ~
+                    TYPTRK_GRP * sqrt(TRNSPD),
+                    data = df_casualties)
+
+cat("=== X Transformation AIC Comparison ===\n")
+cat("Box-Cox Y only:", AIC(cas.lm2.so.box), "\n")
+cat("Box-Cox Y + log(X+1):", AIC(cas.lm3.logx), "\n")
+cat("Box-Cox Y + sqrt(X):", AIC(cas.lm3.sqrtx), "\n")
+
+cat("\nAdjusted R^2 Comparison:\n")
+cat("Box-Cox Y only:", summary(cas.lm2.so.box)$adj.r.squared, "\n")
+cat("Box-Cox Y + log(X+1):", summary(cas.lm3.logx)$adj.r.squared, "\n")
+cat("Box-Cox Y + sqrt(X):", summary(cas.lm3.sqrtx)$adj.r.squared, "\n")
+```
+
+**Result:** AIC comparison (55.76 vs 68.00, 74.32) shows X transformation does not improve the model. Residual issues stem from Y's discrete structure, not X. We retain `cas.lm2.so.box` as the final model.
+
+### Step 9: Bootstrap Confidence Intervals
+Although the Box-Cox method has addressed many issues with residual plots, normality and homoscedasticity remain significant problems. Therefore, we apply bootstrapping, a nonparametric method that does not assume normality.
+```{r cas2_boot}
+boot.fn <- function(data, index){
+  fit <- lm((Casualties^L - 1)/L ~
+            TYPTRK_GRP * TRNSPD + I(TRNSPD^2),
+            data = data, subset = index)
+  coef(fit)
+}
+
+set.seed(415)
+boot.result <- boot(df_casualties, boot.fn, R = 1000)
+boot.result
+```
+
+**Bootstrap coefficients:**
+- t1*: (Intercept)
+- t2*: TYPTRK_GRPYardType
+- t3*: TRNSPD
+- t4*: I(TRNSPD^2)
+- t5*: TYPTRK_GRPYardType:TRNSPD
+
+To evaluate coefficient reliability, R = 1,000 resamples were drawn. All coefficients show bias near zero, demonstrating original estimates are unbiased and not overfit to sample noise — strong statistical evidence of population stability.
+
+```{r cas2_boot_ci}
+ci_b0 <- boot.ci(boot.result, index = 1, type = "perc")
+ci_b1 <- boot.ci(boot.result, index = 2, type = "perc")
+ci_b2 <- boot.ci(boot.result, index = 3, type = "perc")
+ci_b3 <- boot.ci(boot.result, index = 4, type = "perc")
+ci_b4 <- boot.ci(boot.result, index = 5, type = "perc")
+
+boot_summary <- data.frame(
+  Term     = c("Beta_0 (Intercept)",
+               "Beta_1 (YardType)",
+               "Beta_2 (TRNSPD)",
+               "Beta_3 (TRNSPD^2)",
+               "Beta_4 (YardType:TRNSPD)"),
+  Estimate = boot.result$t0,
+  CI_lower = c(ci_b0$percent[4], ci_b1$percent[4],
+               ci_b2$percent[4], ci_b3$percent[4], ci_b4$percent[4]),
+  CI_upper = c(ci_b0$percent[5], ci_b1$percent[5],
+               ci_b2$percent[5], ci_b3$percent[5], ci_b4$percent[5])
+)
+
+print(boot_summary)
+```
+
+**Background:** Even after Box-Cox, residuals do not fully follow normal distribution (count-data artifact). OLS standard errors and p-values risk underestimation (Type I Error).
+
+**Solution: nonparametric bootstrap (R = 1,000).** Procedure:
+1. Resample n = ~3,982 with replacement 1,000 times.
+2. Fit identical model to each resample.
+3. Compute percentile CI from 1,000 coefficient estimates.
+
+**Key results:**
+- **Beta_1 (YardType):** 95% CI [-0.1505, -0.0733] — does not contain 0 — significant.
+- **Beta_3 (TRNSPD^2):** 95% CI [0.00000123, 0.0000298] — does not contain 0 — significant.
+- **Beta_4 (interaction):** 95% CI [-0.0003, 0.0069] — **contains 0** — **not significant**.
+
+### Step 10: Cross-Validation
+
+```{r cas2_cv}
+setwd(sourcedir)
+source("TestSet.R")
+
+test.size <- 1/3
+pmse.no_inter.result <- NULL
+pmse.inter.result <- NULL
+
+set.seed(415)
+for (i in 1:20) {
+  casualties.data <- test.set(df_casualties, test.size)
+
+  cas.lm.no_inter.train <- lm((Casualties^L - 1)/L ~
+                                TYPTRK_GRP + TRNSPD + I(TRNSPD^2),
+                              data = casualties.data$train)
+
+  cas.lm.inter.train <- lm((Casualties^L - 1)/L ~
+                             TYPTRK_GRP * TRNSPD + I(TRNSPD^2),
+                           data = casualties.data$train)
+
+  cas.lm.no_inter.pred <- predict(cas.lm.no_inter.train,
+                                  newdata = casualties.data$test)
+  cas.lm.inter.pred <- predict(cas.lm.inter.train,
+                               newdata = casualties.data$test)
+
+  test_y_transformed <- (casualties.data$test$Casualties^L - 1)/L
+
+  pmse.no_inter <- mse(cas.lm.no_inter.pred, test_y_transformed)
+  pmse.inter <- mse(cas.lm.inter.pred, test_y_transformed)
+
+  pmse.no_inter.result <- c(pmse.no_inter.result, pmse.no_inter)
+  pmse.inter.result <- c(pmse.inter.result, pmse.inter)
+}
+
+Index <- 1:length(pmse.no_inter.result)
+df_cv <- data.frame(
+  Index = Index,
+  pmse_no_inter = pmse.no_inter.result,
+  pmse_inter = pmse.inter.result
+)
+
+ggplot(data = df_cv, aes(x = Index)) +
+  geom_line(aes(y = pmse_no_inter), color = 'blue', size = 1) +
+  geom_line(aes(y = pmse_inter), color = 'red', linetype = 'twodash', size = 1) +
+  ggtitle("Model Comparison Based on PMSE (Casualties)") +
+  ylab("PMSE") +
+  xlab("Iteration") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+**Results: PMSE trajectories overlap.** Across all 20 iterations, the red (interaction) and blue (no-interaction) PMSE lines are nearly indistinguishable (max difference < 0.001 on transformed scale). The interaction term provides no out-of-sample predictive advantage.
+
+**Quantitative finding:** Both models yield PMSE in [0.058, 0.061] on the Box-Cox-transformed scale.
+
+**Interpretation: overfitting confirmed.**
+
+- OLS in-sample: Beta_4 = 3.66e-03, p = 0.029 (appears significant).
+
+- Bootstrap 95% CI: [-2.77e-04, 6.91e-03] (contains 0 — not significant).
+- Cross-validation: equal predictive performance.
+
+**Two independent methods (Bootstrap, CV) agree:**
+the interaction term is not statistically significant and provides no predictive value.
+
+### Step 11: Robustness Check — Poisson GLM
+As a supplementary analysis, we fit a Poisson GLM to examine whether the conclusions hold under a theoretically more appropriate count-data model (per GLM framework; see lecture notes). 
+
+Note that Casualties is a discrete count variable, and as introduced in lecture, Poisson GLM with log(E[Y]) link function is theoretically more appropriate than Box-Cox OLS — as it assumes Poisson-distributed residuals (Var(Y) = E[Y]) rather than constant variance independent of E[Y].
+(same as HYPOTHESIS 3)
+```{r}
+cas2.glm <- glm(Casualties ~ TYPTRK_GRP * TRNSPD + I(TRNSPD^2),
+                family = poisson(link = "log"),
+                data   = df_casualties)
+
+summary(cas2.glm)
+```
+Since the p-value for the interaction term of TYPTRK_GRPYardType:TRNSPD is <2e-16, it appears to be highly significant.
+However, as this conclusion **contradicts the bootstrap method**, a non-parametric approach trusted earlier, 
+we proceed with a more detailed investigation.
+
+#interaction plot
+```{r}
+# GLM prediction data for Hypothesis 4
+newdata_glm <- expand.grid(
+  TRNSPD     = seq(min(df_casualties$TRNSPD, na.rm=TRUE),
+                   max(df_casualties$TRNSPD, na.rm=TRUE),
+                   length.out = 100),
+  TYPTRK_GRP = c("OpenLine", "YardType")
+)
+
+newdata_glm$pred <- predict(cas2.glm,
+                            newdata = newdata_glm,
+                            type = "response")
+
+# Simultaneous comparison of actual data + OLS lines + GLM lines
+ggplot(df_casualties, 
+       aes(x = TRNSPD, y = Casualties, 
+           color = TYPTRK_GRP)) +
+  # actual data points
+  geom_point(alpha = 0.2, size = 1) +
+  # OLS regression line
+  geom_smooth(method = "lm", se = FALSE,
+              linetype = "dashed", size = 1,
+              aes(group = TYPTRK_GRP)) +
+  # GLM prediction line
+  geom_line(data = newdata_glm,
+            aes(x = TRNSPD, y = pred, 
+                color = TYPTRK_GRP),
+            size = 1.2) +
+  coord_cartesian(ylim = c(0, 20)) +
+  scale_color_manual(values = c("OpenLine" = "tomato",
+                                "YardType" = "steelblue")) +
+  labs(
+    title    = "OLS vs Poisson GLM: Speed-Casualty Relationship",
+    subtitle = "Dashed = OLS, Solid = Poisson GLM",
+    x        = "Train Speed (mph)",
+    y        = "Casualties",
+    color    = "Track Type"
+  ) +
+  theme_bw() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+```
+As confirmed by the plot, the strong interaction significance in the Poisson GLM is likely inflated by 
+**extrapolation artifacts** arising from the sparsity of YardType high-speed data.
+This mirrors the same structural issue identified in Hypothesis 3.
+
+The Bootstrap conclusion (Fail to Reject H0), which appropriately captures this data sparsity as statistical uncertainty,is therefore considered more reliable.
+
+Returning to the **two independent conclusions derived earlier:**
+
+> **Two independent methods (Bootstrap, CV) agree:** 
+> the interaction term is not statistically significant 
+> and provides no predictive value.
+
+**We therefore fail to reject the null hypothesis.**
+
+---
+
+# Problem 4: Evidence and Recommendation to FRA (15 points)
+
+## (a) Assessment of Null Hypotheses
+
+This section assesses, for each of the four hypotheses, whether the null hypothesis can be rejected, and supports each conclusion with formal measures of statistical confidence.
+
+### Hypothesis 1 (ACCDMG): Location Type x Train Speed — REJECT H0
+
+**Null hypothesis decision:** **Reject H0**, accept H1.
+
+The objective of the analysis was to examine whether the effect of train speed on damage (speed sensitivity) differs between urban and rural accident locations. The interaction term was statistically highly significant, supporting the alternative.
+
+**Statistical evidence and interpretation:**
+
+- **Interaction term significance:** In the final model, `LOCATION_TYPEUrban:TRNSPD_c` carries a p-value of 2.05 x 10^-6 (p < 0.001). At the 1% significance level, this is highly significant evidence that speed sensitivity differs by location.
+- **Direction of speed sensitivity:** The reference category (rural) speed main effect is Beta = 1.567 x 10^-5 (positive). The urban interaction coefficient is Beta = -3.540 x 10^-6 (negative), meaning the urban speed sensitivity is lower (gentler) than rural. Equivalently, **rural areas have a steeper speed-damage slope than urban areas** — consistent with H1 (t = -4.752).
+- **Methodological soundness:** The model (Adjusted R-squared = 0.1466, F-statistic = 355.2) handled the dependent-variable non-normality via Box-Cox transformation and the structural multicollinearity via mean-centering. After centering, all VIFs are well below 10 — TRNSPD_c at 2.47, I(TRNSPD_c^2) at 1.85, and the interaction at 1.48 — ensuring all coefficient estimates and p-values are reliable. The Box-Cox transformation simultaneously satisfies normality and homoscedasticity, while CARS (the hazmat-cars control) at p = 7.01 x 10^-9 was integrated robustly without compromising the interaction's significance.
+
+### Hypothesis 2 (ACCDMG): Mega Train x Train Speed — REJECT H0
+
+**Null hypothesis decision:** **Reject H0**, accept H1.
+
+The objective was to verify whether train speed sensitivity differs by mega-train (>=100 cars) status. The interaction term showed extremely high significance, supporting the alternative.
+
+**Statistical evidence and interpretation:**
+
+- **Interaction term significance:** The `MEGA_TRAINYes:TRNSPD_c` term has p < 2 x 10^-16 — extremely significant at any reasonable level. Speed sensitivity differs by physical scale (mass) of the train.
+- **Direction of speed sensitivity:** The interaction coefficient is Beta = 7.488 x 10^-6 (clearly positive). For mega-trains, the speed-damage slope is steeper than for regular trains by Beta(reference) + Beta(interaction) = 1.085 x 10^-5 + 7.488 x 10^-6. Damage rises markedly faster with speed when the train is a mega-train (t = 10.046). This validates the "accordion-style pile-up" hypothesis: trains with massive trailing inertia destroy more cars sequentially during high-speed derailment.
+- **Methodological soundness:** The model (Adjusted R-squared = 0.1686, F-statistic = 335.6) controls multicollinearity via mean-centering. After centering, VIFs are TRNSPD_c at 2.47, I(TRNSPD_c^2) at 1.85, and the interaction at 1.48 — all far below the threshold of 10. The Box-Cox transformation (`ACCDMG_BC`) handled extreme right-skew, and the hazmat-cars control (CARS at p = 7.01 x 10^-9) entered as a robust independent damage-amplification factor without compromising the interaction.
+
+### Hypothesis 3 (Casualties): Accident Type x Train Speed — FAIL TO REJECT H0
+
+**Null hypothesis decision:** **Fail to reject H0** at significance level alpha = 0.05.
+
+This conclusion is consistently supported by four independent methods:
+
+| Method | Statistic | Decision |
+|--------|-----------|----------|
+| OLS p-value (cas1.lm3) | p = 0.359 | Not significant (alpha = 0.05) |
+| Partial F-test | F = 2.4995, p = 0.1143 | No additional explanatory power |
+| Bootstrap 95% CI (R = 1,000) | [-0.00409, 0.00179] | Contains 0 — fail to reject H0 |
+| 10-Fold CV PMSE (B - A) | +0.000217 | No predictive contribution |
+
+The Bootstrap CI is the most reliable inference tool here because it is distribution-free — important given that residuals violate normality and homoscedasticity. The coefficient estimate (Beta_3 = -0.00124) matches the hypothesized direction (negative), but the 95% CI includes 0, so it cannot be considered statistically significant.
+
+**Significance of main effects:** While the interaction is non-significant, both main-effect variables are highly significant.
+
+| Variable | Coefficient (Beta) | p-value | Interpretation |
+|----------|-------------------|---------|----------------|
+| TRNSPD | 7.312 x 10^-3 | < 2e-16 | Each 1 mph speed increase raises casualties (common effect) |
+| TYPE_GROUPCollision | 1.065 x 10^-1 | = 0.00194 | Collision baseline casualties significantly higher than derailment (intercept difference) |
+| TYPE_GROUPCollision:TRNSPD | -1.238 x 10^-3 | 0.359 (n.s.) | Slope difference cannot be confirmed statistically |
+
+**Main effects: speed and accident type.** Regression and forward selection consistently identified train speed (TRNSPD) and accident-type group (TYPE_GROUP) as the two strongest predictors of casualty count. In the Box-Cox model (cas1.lm3), TRNSPD has a strongly significant positive coefficient (Beta = 7.312 x 10^-3, p < 2e-16), confirming that higher operating speed raises casualty severity across all accident types. This aligns with the kinetic-energy transfer mechanism reported in the literature: casualty severity is proportional to the square of impact speed, so even small speed increases yield exponentially amplified injury outcomes (Evans, 2011; Barkan et al., 2003).
+Contrary to what slope-based hypothesis testing suggested, the major difference between collision and derailment lies not in the speed coefficient but in the intercept. Although the interaction coefficient (Beta_3 = -0.00124) is in the hypothesized direction — consistent with H1 that derailments are more speed-sensitive than collisions — the 95% Bootstrap CI [-0.00409, 0.00179] includes zero, so statistical significance cannot be established. The model retained TYPE_GROUP as a significant main effect (Beta_Collision = 1.065 x 10^-1, p = 0.00194), indicating that — controlling for operating speed — collisions systematically generate higher baseline casualty counts than derailments. This finding aligns with Liu et al. (2012), who noted that collision events involve concentrated kinetic-energy transfer between two moving objects, generating more severe collision-point forces compared to the more dispersed mechanical failures of derailments. Additionally, forward selection independently identified TYPEQ (Commuter; Beta = 3.183 x 10^-1, p = 0.037) as a significant predictor, further emphasizing that vehicle occupancy and train composition independently inflate casualty counts beyond what accident type alone can capture (Liu, 2016).
+**Structural reasons for non-significant interaction:**
+
+**1. Train-type confounding (omitted variable bias).** The most important explanation surfaces from the forward-selection process itself. When TYPEQ (train operation category) enters the model, the interaction term loses all marginal explanatory power and is excluded. This pattern is consistent with omitted variable bias (Rosenbaum & Rubin, 1983). Collision accidents are disproportionately associated with passenger and commuter services, which operate at higher speeds and carry more passengers per train — inflating high-speed casualties. Once train type is controlled, the apparent speed sensitivity difference between collision and derailment disappears. In other words, what appeared to be different slopes is largely attributable to confounded compositional differences across the two accident-type groups, rather than a genuine mechanical difference in speed response (Liu, 2016; Liu et al., 2012).
+
+**2. PTC and high-speed collision data sparsity.** The 2008 Rail Safety Improvement Act (RSIA, 2008) mandated PTC adoption on high-density passenger and freight corridors. Because PTC was specifically designed to prevent train-to-train collisions through automatic speed control and collision avoidance, its deployment asymmetrically suppresses collision events at the upper end of the speed distribution (Barkan et al., 2003). The result is a structural sparsity of high-speed collision observations in the FRA Accident/Incident Database, depriving the regression of evidence in the very region where the hypothesized differential effect would be most visible. This data-generation asymmetry inflates Beta_3's standard error and reduces statistical power to detect a non-zero effect.
+
+**3. Limited common support and small collision sample.** In the filtered sample (Casualties >= 1), the collision subgroup is substantially smaller than the derailment subgroup. With limited common support across the speed distribution — that is, limited overlap in TRNSPD values where both accident types are well represented — the interaction coefficient is estimated from a narrow effective sample, yielding wide confidence intervals (Cohen, 1988). This is a form of the limited overlap problem described in causal inference (Rosenbaum & Rubin, 1983). When two groups' covariate distributions do not overlap adequately, interactions between group and covariate become difficult to identify reliably.
+
+**4. Discreteness and distributional constraints.** Casualty counts are non-negative integers with a heavily right-skewed distribution concentrated near zero. Box-Cox transformation partially addresses this non-normality (Sakia, 1992) but does not eliminate the floor effect inherent in count data — namely, that most casualty-bearing events involve relatively few injuries, while the high-casualty tail is populated by rare large-casualty events that introduce substantial noise. These distributional constraints limit the resolution at which interaction effects (which require detecting curvature differences between two groups) can be identified within a linear regression framework.
+
+### Hypothesis 4 (Casualties): Track Type x Train Speed — FAIL TO REJECT H0
+
+**Null hypothesis decision:** **Fail to reject H0**.
+
+| Method | Statistic | Decision |
+|--------|-----------|----------|
+| OLS p-value | p = 0.029 | Appears significant (in-sample only) |
+| Bootstrap 95% CI (R = 1,000) | [-2.77e-04, 6.91e-03] | Contains 0 — fail to reject H0 |
+| 10-Fold CV PMSE difference | < 0.001 (negligible) | No predictive value |
+
+The OLS in-sample p-value of 0.029 appears significant at first glance, but two more reliable methods reveal this to be a sample-level artifact. The Bootstrap 95% CI clearly contains 0, indicating the interaction is not statistically significant under distribution-free inference. Cross-validation across 20 train-test splits shows that adding the interaction term yields essentially equal out-of-sample PMSE — meaning the interaction provides no actual predictive advantage beyond the simpler model. **Therefore, the OLS in-sample significance reflects overfitting to sample noise rather than a genuine population-level effect.**
+
+**Significance of main effects:** As in Hypothesis 3, while the interaction fails, both main effects are robustly significant.
+
+- **Beta_1 (YardType):** 95% Bootstrap CI [-0.1505, -0.0733] — does not contain 0. YardType has approximately 12% lower baseline casualties than OpenLine, attributable to lower operating speeds and standardized procedures.
+- **Beta_3 (I(TRNSPD^2)):** 95% Bootstrap CI [1.23e-06, 2.98e-05] — does not contain 0. The kinetic-energy quadratic effect is robust across resamples — speeds dramatically amplify casualties when squared.
+
+**Conclusion:** Track-type-specific speed reduction policies are not supported by the data. Universal speed reduction is the more empirically defensible policy direction, with track-type-specific interventions targeting the (significant) main effects rather than the (non-significant) interaction.
+
+### Cross-Hypothesis Synthesis
+
+Across the four hypotheses, a consistent pattern emerges:
+
+1. **Train speed is universally and strongly significant** as a main effect on both ACCDMG and Casualties — confirming kinetic energy as the dominant driver of severity.
+2. **The quadratic speed term (kinetic-energy structure) holds across all ACCDMG hypotheses** and within Hypothesis 4 (Casualties). It does not survive in Hypothesis 3 (Casualties) due to the small Collision sample's limited high-speed coverage.
+3. **Interaction effects are present for ACCDMG but absent for Casualties.** Damage scales with location infrastructure and train mass interacting with speed; casualty count, by contrast, is captured well by additive main effects of speed and accident/track type, with intercept differences explaining most of the cross-group variation.
+4. **Bootstrap and cross-validation consistently identify which interactions are real** versus sample artifacts. For ACCDMG, both methods confirm the interactions; for Casualties, both methods deny them.
+
+This pattern suggests two distinct mechanisms: damage scales multiplicatively with structural conditions and speed (justifying differentiated infrastructure-based regulation), while casualty count scales additively (justifying universal speed reduction with targeted vulnerability protection in commuter/passenger contexts).
+
+---
+
+## (b) Findings Summary and FRA Safety Recommendations
+
+The following findings and recommendations are based on the converging statistical evidence from all four hypotheses. The recommendations are presented in order of strength of evidence and ease of implementation.
+
+### Insight 1: Universal Speed Reduction is the Single Most Effective Intervention
+
+**Evidence:** Across all four hypotheses, train speed is universally a significant predictor of severity. In ACCDMG analyses, the kinetic-energy quadratic term (I(TRNSPD^2)) is highly significant, and even in Casualties analyses where the kinetic-energy term does not survive in Hypothesis 3, the linear speed coefficient is among the most strongly significant predictors. Critically, the Casualties analyses (Hypotheses 3 and 4) show **no significant interaction between speed and accident or track type**, meaning the effect of speed reduction is uniform across operational contexts — every mph reduction yields the same proportional casualty reduction whether the accident is a derailment or collision, whether on OpenLine or YardType.
+
+**Recommendation:** The FRA should strengthen and expand uniform speed-cap enforcement across all track classes. While differentiated speed regulations remain valuable for damage-management, casualty-management benefits most from universal speed reduction. Specifically:
+
+- **Tighten enforcement** of existing speed limits via PTC-integrated automatic speed governors, particularly in passenger-density corridors and segments with known geometry irregularities.
+- **Lower default speed caps** by 5-10 mph in track classes where current limits have been calibrated decades ago without contemporary kinetic-energy modeling.
+- **Mandate enhanced monitoring and reporting** of speed-violation incidents so that aggregate speed-reduction effectiveness can be measured longitudinally.
+
+**Expected impact:** Based on the kinetic-energy relationship (E proportional to v^2), a 10% speed reduction from 60 mph to 54 mph would reduce kinetic energy by 19%. For damage and casualties scaling with v-squared, this represents a substantial decrease in expected severity per accident.
+
+### Insight 2: Rural Areas are "Hidden Time Bombs" for High-Speed Damage
+
+**Evidence:** Hypothesis 1 (ACCDMG) Reject H0: the interaction LOCATION_TYPE x TRNSPD is significantly negative for the urban indicator (-3,540 x 10^-6, p = 2.05 x 10^-6), meaning rural areas exhibit a disproportionately steeper damage curve at high speeds. While urban areas show higher baseline damage (more infrastructure to damage), rural high-speed accidents escalate more rapidly because of inadequate emergency response infrastructure, longer accessibility distances for fire and rescue services, and absence of immediate damage-containment infrastructure.
+
+**Recommendation:** The FRA should reverse the implicit "rural = lower priority" stance in resource allocation:
+
+- **Preventive maintenance budget reallocation:** Prioritize preventive infrastructure (rail integrity sensors, automated track geometry measurement, defect detection) on rural high-speed freight and passenger corridors.
+- **Rural emergency response infrastructure:** Pre-position emergency response equipment (rerailing equipment, fire suppression, hazmat response) along major rural rail corridors to compress the time-to-response from current rural baselines closer to urban response times.
+- **Risk-based corridor classification:** Develop a rural-corridor risk index incorporating distance to nearest emergency facility, terrain, weather exposure, and historical incident severity, and apply differentiated speed caps to the highest-risk rural segments.
+
+**Expected impact:** Rural derailments typically account for the highest-damage incidents in the FRA database. Even a 20-30% reduction in rural mega-incident severity would meaningfully shift the upper tail of the damage distribution.
+
+### Insight 3: Mega-Trains Require Mass-Speed Coupled Regulation
+
+**Evidence:** Hypothesis 2 (ACCDMG) Reject H0: the interaction MEGA_TRAIN x TRNSPD is significantly positive (Beta = 7.488 x 10^-6, p < 2 x 10^-16). For mega-trains (>=100 cars), the damage-per-mph slope is dramatically steeper than for regular trains, validating the "accordion-style pile-up" mechanism. Furthermore, the hazmat-cars control variable (CARS) shows independent strong significance (p = 7.01 x 10^-9), confirming hazmat is an independent fuel-amplifier of damage.
+
+**Recommendation:** Move from track-class-only speed regulation to mass-speed-coupled differential regulation:
+
+- **Mega-train-specific speed caps:** Mandate lower maximum speeds for trains exceeding 100 cars or specified gross tonnage thresholds, with even lower caps when hazmat content exceeds defined levels. The current uniform-by-track-class regulation does not account for the mega-train mass-speed interaction the data clearly shows.
+- **ECP brake mandate for mega-trains:** Require Electronically Controlled Pneumatic (ECP) brakes on all trains exceeding 100 cars carrying hazmat, ensuring that emergency braking from rear locomotives (Distributed Power Units, DPUs) is instantaneous rather than propagated mechanically — directly addressing the trailing-cars-momentum mechanism.
+- **Risk-based block marshalling:** Mandate buffer cars between hazmat-containing blocks in mega-train consists. Continuous hazmat blocks dramatically increase fire-propagation risk during cascade derailment; physical separation via buffer cars provides energy-absorbing breaks.
+
+**Expected impact:** Mega-train accidents currently account for the most catastrophic damage incidents (such as East Palestine, Tamaroa). Even a 30-40% reduction in mega-train high-speed damage severity would substantially reduce extreme-tail damage events.
+
+### Insight 4: Casualty Mitigation Must Target Train Type, Not Just Track or Accident Type
+
+**Evidence:** Hypotheses 3 and 4 (Casualties) Fail to Reject H0 on interaction, but the forward-selection result for Hypothesis 3 reveals that TYPEQ (Commuter) is selected with significance (p = 0.037, Beta = 3.183 x 10^-1) — meaning that, controlling for speed, accident type, and tonnage, commuter trains independently produce more casualties. Hypothesis 4's main-effects analysis similarly shows YardType has 12% lower baseline casualties than OpenLine. Both suggest that **train type / operating context is a stronger casualty-shaping factor than the interaction between speed and accident or track type**.
+
+**Recommendation:** Build a train-type-stratified casualty mitigation strategy:
+
+- **Passenger and commuter train priority:** Concentrate derailment-prevention infrastructure (track-geometry monitoring, switch-point inspection frequency) on routes carrying passenger and commuter services where occupancy density is highest.
+- **Standardized emergency egress and impact-absorption standards:** Strengthen vehicle crashworthiness, emergency egress procedures, and shock-absorption requirements specifically for passenger and commuter rolling stock.
+- **YardType best-practice transfer:** Study what operational practices make YardType safer (low speed, trained personnel, standardized procedures) and systematically apply learnable elements (work-area speed restrictions, mandatory crew-pause protocols) to OpenLine yards and switching points.
+
+**Expected impact:** Passenger and commuter incidents, though less frequent than freight derailments, account for a disproportionate share of total casualties because of occupancy density. Casualty reduction in this segment yields the highest absolute impact per intervention.
+
+### Insight 5: Derailment Prevention Requires Prioritized Speed Enforcement and Infrastructure Investment to fill PTC Coverage Gap
+
+**Evidence:** Hypothesis 3 (Casualties) fails to reject H0 on the interaction term, but the underlying asymmetry between accident types has important policy implications. PTC was legislatively mandated (RSIA, 2008) specifically to prevent train-to-train collisions via automatic speed control and collision avoidance — and the data reflect this: high-speed collision events are structurally sparse in the FRA database, as PTC has already suppressed them at the upper end of the speed distribution. Derailments, by contrast, originate from track geometry failure, rail defects, and substructure degradation — causal mechanisms that PTC is architecturally incapable of detecting or preempting. Descriptive statistics and interaction plots consistently show that casualty concentration at high operating speeds is driven predominantly by derailment events, and the interaction coefficient (Beta_3 = -0.00124) is directionally consistent with H1 — suggesting derailments are more speed-sensitive than collisions — even if the estimate does not reach statistical significance under current sample conditions. This directional pattern, combined with the PTC coverage gap, points to a systematic regulatory blind spot for high-speed derailments.This does not contradict the universal speed reduction finding from Insight 1. Rather, it identifies where within the network universal speed reduction should be prioritized first, and what complementary infrastructure investments are needed to replicate for derailments the real-time protective coverage that PTC already provides for collisions.
+
+**Recommendation:** The FRA should establish a derailment-specific, risk-based speed regulatory framework to provide the same level of technical protection for derailment scenarios that PTC currently provides for collision scenarios:
+
+**Priority speed enforcement on derailment-prone segments:** While universal speed reduction applies across all track classes (Insight 1), the FRA should prioritize enforcement resources on segments identified by a composite derailment risk index — rail defect frequency, curve radius, and embankment subsidence. This ensures that the universal speed reduction policy yields the greatest casualty reduction per enforcement dollar in the segments where derailment risk is highest.
+**Mandatory Automated Track Geometry Measurement System (ATGMS) deployment:** Strengthen the FRA's operational standards for automated track geometry monitoring and require that anomaly detection events trigger immediate, enforceable speed reduction orders — closing the gap between inspection and intervention that currently allows degraded geometry to persist under full operating speed.
+**PTC-derailment integration roadmap:** Direct the FRA's Office of Railroad Safety to develop a technology integration roadmap connecting ATGMS anomaly data with PTC speed-enforcement infrastructure, so that track-condition-based speed commands can be issued automatically — replicating for derailments the real-time enforcement capability PTC already provides for collisions.
+
+**Expected impact:** Collision risk on high-density corridors has been substantially reduced by PTC deployment; the remaining frontier for casualty reduction is high-speed derailment on track with undetected or under-reported geometry defects. Even a moderate reduction in operating speed on the highest-risk 10–15% of the network — those segments combining high speed, poor geometry, and limited emergency access — would disproportionately reduce the large-casualty tail of the derailment distribution.
+
+---
+
+# References
+
+Ahmed, S. S., Corman, F., and Anastasopoulos, P. C. (2023). Accounting for unobserved heterogeneity and spatial instability in the analysis of crash injury-severity at highway-rail grade crossings: A random parameters with heterogeneity in the means and variances approach. *Analytic Methods in Accident Research*, 37, 100250.
+
+Anderson, D. L. (2018). Energy Absorption in Train-Vehicle Collisions: Physical Principles and Engineering Applications. *Transportation Safety Review*, 12(2), 34-52.
+
+Barkan, C. P. L., Dick, C. T., and Anderson, R. (2003). Railroad derailment factors affecting hazardous materials transportation risk. *Transportation Research Record*, 1825(1), 64-74.
+
+Cohen, J. (1988). *Statistical Power Analysis for the Behavioral Sciences* (2nd ed.). Lawrence Erlbaum Associates.
+
+Davison, A. C., and Hinkley, D. V. (1997). *Bootstrap Methods and Their Application*. Cambridge University Press.
+
+Efron, B. (1979). Bootstrap methods: Another look at the jackknife. *The Annals of Statistics*, 7(1), 1-26.
+
+Evans, A. W. (2011). Fatal train accidents on Europe's railways: 1980-2009. *Accident Analysis & Prevention*, 43(1), 391-401.
+
+Federal Railroad Administration. (2020). *Positive Train Control (PTC) implementation status*. U.S. Department of Transportation.
+
+Federal Railroad Administration. (2020). *Train Accident Data and Causal Factors: A Comprehensive Analysis 2010-2019*. Office of Safety Analysis.
+
+Fox, J., and Weisberg, S. (2016). *An R Companion to Applied Regression* (3rd ed.). SAGE Publications.
+
+Hao, W., and Daniel, J. (2014). Motor vehicle driver injury severity study under various traffic control at highway-rail grade crossings in the United States. *Journal of Safety Research*, 51, 41-48.
+
+Harrell Jr, F. E. (2015). *Regression Modeling Strategies: With Applications to Linear Models, Logistic and Ordinal Regression, and Survival Analysis* (2nd ed.). Springer.
+
+Hosmer Jr, D. W., Lemeshow, S., and Sturdivant, R. X. (2013). *Applied Logistic Regression* (3rd ed.). John Wiley & Sons.
+
+International Atomic Energy Agency. (2003). *Input data for quantifying risks associated with the transport of radioactive material* (IAEA-TECDOC-1346). IAEA, Vienna.
+
+Kazaras, K., Amas, V., and Symeonidis, A. (2012). Classification of accident severity in railway transportation systems: A statistical and Bayesian network approach. *Transportation Research Record*, 2289, 83-91.
+
+Khan, W. A., and Khattak, A. J. (2018). Injury severity of truck drivers in crashes at highway-rail grade crossings in the United States. *Transportation Research Record*, 2672(10), 38-47.
+
+King, S., and Roberts, J. (1987). Railroad Safety: Evidence on the Effectiveness of Accident Prevention. *Journal of Transportation Research Forum*, 28(1), 25-33.
+
+Liu, X. (2016). Freight-train derailment rates for railroad safety and risk analysis. *Accident Analysis & Prevention*, 98, 1-9.
+
+Liu, X. (2016). Analysis of Collision Risk for Freight Trains in the United States. *Transportation Research Record*, 2546, 121-128.
+
+Liu, X., Barkan, C. P. L., and Saat, M. R. (2011). Analysis of derailments by accident cause: Evaluating railroad track upgrades to reduce transportation risk. *Transportation Research Record*, 2261, 178-185.
+
+Liu, X., Saat, M. R., and Barkan, C. P. L. (2012). Analysis of causes of major train derailment and their effect on accident rates. *Transportation Research Record*, 2289(1), 154-163.
+
+NRC. *NUREG/CR-7034. Analysis of Severe Railway Accidents Involving Long Duration Fires*.
+
+Rail Safety Improvement Act of 2008, Pub. L. No. 110-432, 122 Stat. 4848 (2008).
+
+Rosenbaum, P. R., and Rubin, D. B. (1983). The central role of the propensity score in observational studies for causal effects. *Biometrika*, 70(1), 41-55.
+
+Sakia, R. M. (1992). The Box-Cox transformation technique: A review. *Journal of the Royal Statistical Society: Series D (The Statistician)*, 41(2), 169-178.
+
+Stone, M. (1974). Cross-validatory choice and assessment of statistical predictions. *Journal of the Royal Statistical Society: Series B (Methodological)*, 36(2), 111-147.
+
+---
+
+# Acknowledgements
+
+This analysis was developed with the assistance of Claude AI (Anthropic) for: 
+(1) translating Korean-language analytical commentary into English while preserving statistical content and citations, 
+(2) standardizing the formatting and notation across the four hypothesis sub-analyses contributed by different group members, 
+(3) organizing the report structure to align with the project specification (Problems 1-4 with appropriate sub-questions)
+(4) recommending relevant academic references and FRA policy documents to support the theoretical justifications and policy recommendation sections.
+The statistical analyses, hypothesis formulations, and underlying conclusions are the original work of the group members; AI assistance was confined to language and presentation.
+
+#prompt
+"다음 한국어로 작성된 통계 분석 및 이론적 근거를 학술적인 영어로 번역해 줘. 통계 용어, 변수명, 학술 인용구는 제공된 그대로 정확하게 유지해 줘"
+
+"서로 다른 팀원들이 작성한 다음 4개의 가설 섹션들의 표현 형식을 표준화 해줘. 가장 R markdown 형식을 잘 지킨 사람 포맷을 기준으로. 핵심 분석 내용은 절대 변경하지 말고, 마크다운 헤더, 글머리 기호, 그리고 귀무가설/대립가설에 대한 수학적 표기법을 일관성 있게 맞춰줘"
+
+"다음 취합된 텍스트를 과제 가이드라인에서 요구하는 'Problem 1-4' 구조에 정확히 맞게 재구성해 줘. 각 파트가 자연스럽게 이어지도록 정리해 줘"
+
+"다음 가설의 이론적 근거와 정책 제안 섹션에 사용할 수 있는 관련 학술 논문 및 FRA 정책 문서를 추천해 줘. 철도 안전, 탈선/충돌 사고 분석, 속도-사상자 관계에 관한 peer-reviewed 문헌 위주로 추천해 줘"
